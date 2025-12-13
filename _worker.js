@@ -1,34 +1,24 @@
 /**
- * CF Worker - 单 KV 版本
+ * CF Worker - 单 KV 版本 - 赛博风格管理后台
  * KV 名称：NODE_KV
- * 数据结构：
- * {
- *   "nodes": "...节点文本...",
- *   "logs": { "CN": 5, "US": 2, ... }
- * }
  */
 
-const SUBUpdateTime = 6; // Clash 等客户端轮询间隔（分钟）
+const SUBUpdateTime = 6;
 const ALLOW_UA = /(clash|sing-box|singbox|v2ray|nekobox|surge|quantumult|loon)/i;
+
 const ADMIN_COOKIE_NAME = 'admin_auth';
-const ADMIN_COOKIE_MAX_AGE = 10 * 60; // 10 分钟
-const MAX_PASSWORD_LENGTH = 64;
-const MAX_NODES_LENGTH = 10000; // 节点文本最大长度
+const ADMIN_COOKIE_MAX_AGE = 30 * 60;
+
+const LOGIN_FAIL_LIMIT = 5;
+const LOGIN_FAIL_TIMEOUT = 12 * 60 * 60 * 1000; // 封禁 12 小时
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
-    if (url.pathname === '/sub') {
-      return handleSub(request, env);
-    }
-
-    if (url.pathname === '/admin') {
-      return handleAdmin(request, env, url);
-    }
-
-    return new Response('404 Not Found', { status: 404 });
-  },
+    if (url.pathname === '/sub') return handleSub(request, env);
+    if (url.pathname === '/admin') return handleAdmin(request, env, url);
+    return new Response('404', { status: 404 });
+  }
 };
 
 // -------------------------
@@ -39,145 +29,162 @@ async function handleSub(request, env) {
   const token = url.searchParams.get('token');
   const ua = (request.headers.get('User-Agent') || '').toLowerCase();
 
-  if (!env.SUB_TOKEN || token !== env.SUB_TOKEN) {
-    return new Response('403 Forbidden', { status: 403 });
-  }
-
-  if (!ALLOW_UA.test(ua)) {
-    return new Response('UA Not Allowed', { status: 403 });
-  }
+  if (token !== env.SUB_TOKEN) return new Response('403', { status: 403 });
+  if (!ALLOW_UA.test(ua)) return new Response('403', { status: 403 });
 
   const data = await getKV(env);
 
-  // 记录拉取次数（按国家）
   const country = request.headers.get('CF-IPCountry') || 'N/A';
   data.logs = data.logs || {};
   data.logs[country] = (data.logs[country] || 0) + 1;
 
   await env.NODE_KV.put('data', JSON.stringify(data));
 
-  const base64 = btoa(unescape(encodeURIComponent(data.nodes || '')));
-
-  return new Response(base64, {
-    headers: {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Profile-Update-Interval': `${SUBUpdateTime}`,
-    },
-  });
+  return new Response(
+    btoa(unescape(encodeURIComponent(data.nodes || ''))),
+    {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Profile-Update-Interval': `${SUBUpdateTime}`,
+      },
+    }
+  );
 }
 
 // -------------------------
-// /admin 管理后台
+// /admin 后台
 // -------------------------
 async function handleAdmin(request, env, url) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const cookies = parseCookies(request.headers.get('Cookie') || '');
-  const isAuthenticated = cookies[ADMIN_COOKIE_NAME] === env.ADMIN_TOKEN;
+  const isLogin = cookies[ADMIN_COOKIE_NAME] === env.ADMIN_TOKEN;
+
+  const data = await getKV(env);
+  data.login_fail = data.login_fail || {};
+  const fail = data.login_fail[ip] || { count: 0, last: 0 };
+  const now = Date.now();
+
+  if (fail.count >= LOGIN_FAIL_LIMIT && now - fail.last < LOGIN_FAIL_TIMEOUT) {
+    return html(renderLogin('你已被禁止访问，请稍后再试'));
+  }
 
   if (request.method === 'POST') {
     const form = await request.formData();
-    const password = form.get('password')?.trim();
-    const nodes = form.get('nodes')?.trim();
+    const password = form.get('password');
+    const nodes = form.get('nodes');
 
-    // 登录流程
     if (password && !nodes) {
-      if (password.length > MAX_PASSWORD_LENGTH) {
-        return new Response(renderLogin('密码过长'), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-      }
       if (password === env.ADMIN_TOKEN) {
-        return new Response('<script>location.href="/admin"</script>', {
+        delete data.login_fail[ip];
+        await env.NODE_KV.put('data', JSON.stringify(data));
+
+        return new Response('<script>location="/admin"</script>', {
           headers: [
-            ['Set-Cookie', `${ADMIN_COOKIE_NAME}=${env.ADMIN_TOKEN}; Path=/admin; HttpOnly; Max-Age=${ADMIN_COOKIE_MAX_AGE}`],
-            ['Content-Type', 'text/html; charset=utf-8'],
+            ['Set-Cookie', `${ADMIN_COOKIE_NAME}=${env.ADMIN_TOKEN}; HttpOnly; Path=/admin; Max-Age=${ADMIN_COOKIE_MAX_AGE}`],
+            ['Content-Type', 'text/html'],
           ],
         });
-      } else {
-        return new Response(renderLogin('密码错误'), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       }
+
+      data.login_fail[ip] = { count: fail.count + 1, last: now };
+      await env.NODE_KV.put('data', JSON.stringify(data));
+      return html(renderLogin('密码错误'));
     }
 
-    // 保存节点流程
-    if (!isAuthenticated) {
-      return new Response(renderLogin(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-    }
+    if (!isLogin) return html(renderLogin());
 
-    if (!nodes || nodes.length > MAX_NODES_LENGTH) {
-      return new Response('节点内容为空或过长', { status: 400 });
-    }
-
-    const data = await getKV(env);
-    data.nodes = nodes;
+    data.nodes = nodes || '';
     await env.NODE_KV.put('data', JSON.stringify(data));
-
-    return new Response(renderAdmin(data.nodes || '', data.logs || {}, env.SUB_TOKEN, url), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
-  // GET 请求
-  if (!isAuthenticated) {
-    return new Response(renderLogin(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-  }
+  if (!isLogin) return html(renderLogin());
 
-  const data = await getKV(env);
-  return new Response(renderAdmin(data.nodes || '', data.logs || {}, env.SUB_TOKEN, url), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return html(renderAdmin(data.nodes || '', data.logs || {}, env.SUB_TOKEN, url));
 }
 
 // -------------------------
-// KV 操作封装
+// KV 获取
 // -------------------------
 async function getKV(env) {
   const raw = await env.NODE_KV.get('data');
-  if (!raw) return { nodes: '', logs: {} };
-  try {
-    const parsed = JSON.parse(raw);
-    parsed.logs = parsed.logs || {};
-    return parsed;
-  } catch {
-    return { nodes: '', logs: {} };
-  }
+  return raw ? JSON.parse(raw) : { nodes: '', logs: {}, login_fail: {} };
 }
 
 // -------------------------
-// 管理页面 HTML
+// 赛博风格登录页
 // -------------------------
-function renderAdmin(nodes, logs, subToken, url) {
-  const rows = Object.entries(logs).map(([country, count]) => `
-<tr>
-<td>${country}</td>
-<td>${count}</td>
-</tr>`).join('');
+function renderLogin(msg = '') {
+  return `
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Admin Login</title>
+<style>
+body {background:#0f0c29; color:#0ff; font-family:'Courier New', monospace; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;}
+.container {background: rgba(0,0,0,0.6); padding:40px; border:1px solid #0ff; border-radius:10px; width:300px; text-align:center; box-shadow: 0 0 20px #0ff;}
+input, button {width:100%; padding:10px; margin:10px 0; background:#111; color:#0ff; border:1px solid #0ff; border-radius:5px; font-family:'Courier New', monospace;}
+button:hover {background:#0ff; color:#111; cursor:pointer;}
+.error {color:#f00; font-weight:bold;}
+h2 {margin-bottom:20px;}
+</style>
+</head>
+<body>
+<div class="container">
+<h2>管理员登录</h2>
+${msg ? `<p class="error">${escapeHTML(msg)}</p>` : ''}
+<form method="post">
+<input type="password" name="password" placeholder="输入密码" required>
+<button type="submit">登录</button>
+</form>
+</div>
+</body>
+</html>`;
+}
 
-  // 构建订阅链接
-  const subLink = `${url.protocol}//${url.host}/sub?token=${subToken}`;
+// -------------------------
+// 赛博风格后台
+// -------------------------
+function renderAdmin(nodes, logs, token, url) {
+  const link = `${url.protocol}//${url.host}/sub?token=${token}`;
+  const rows = Object.entries(logs).map(
+    ([c, n]) => `<tr><td>${c}</td><td>${n}</td></tr>`
+  ).join('');
 
-  return `<!doctype html>
+  return `
+<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <title>Node Admin</title>
 <style>
-body{background:#111;color:#eee;font-family:system-ui;padding:20px}
-textarea{width:100%;height:260px;background:#000;color:#0f0}
-table{width:100%;border-collapse:collapse;margin-top:20px;font-size:12px}
-td,th{border:1px solid #333;padding:6px}
-th{background:#222}
-button{margin-top:8px;padding:8px 16px}
-input.sub-link{width:100%;padding:6px;background:#222;color:#0f0;border:none;cursor:text}
+body {background:#0f0c29; color:#0ff; font-family:'Courier New', monospace; margin:0; padding:20px;}
+h2,h3 {border-bottom:1px solid #0ff; padding-bottom:5px;}
+textarea {width:100%; height:260px; background:#111; color:#0ff; border:1px solid #0ff; padding:10px; font-family:'Courier New', monospace; border-radius:5px;}
+input.sub-link {width:100%; padding:10px; background:#111; color:#0ff; border:1px solid #0ff; border-radius:5px; margin-bottom:20px; cursor:text;}
+table {width:100%; border-collapse:collapse; margin-top:10px;}
+td, th {border:1px solid #0ff; padding:8px; text-align:center;}
+th {background:#111;}
+button {padding:10px 20px; margin-top:10px; background:#111; color:#0ff; border:1px solid #0ff; border-radius:5px;}
+button:hover {background:#0ff; color:#111; cursor:pointer;}
+form {margin-bottom:20px;}
 </style>
 </head>
 <body>
 
 <h2>节点管理</h2>
 <form method="post">
-<textarea name="nodes" spellcheck="false">${escapeHTML(nodes)}</textarea><br>
-<button type="submit">保存</button>
+<textarea name="nodes" spellcheck="false">${escapeHTML(nodes)}</textarea>
+<button type="submit">保存节点</button>
 </form>
 
-<h2>当前订阅链接</h2>
-<input class="sub-link" type="text" readonly value="${subLink}" onclick="this.select()">
+<h3>当前订阅链接</h3>
+<input class="sub-link" value="${link}" onclick="this.select()" readonly>
 
-<h2>订阅拉取记录（按国家统计）</h2>
+<h3>订阅拉取统计</h3>
 <table>
-<tr><th>国家</th><th>拉取次数</th></tr>
-${rows || '<tr><td colspan="2">暂无记录</td></tr>'}
+<tr><th>国家</th><th>次数</th></tr>
+${rows || '<tr><td colspan=2>暂无记录</td></tr>'}
 </table>
 
 </body>
@@ -185,46 +192,16 @@ ${rows || '<tr><td colspan="2">暂无记录</td></tr>'}
 }
 
 // -------------------------
-// 登录页面 HTML
-// -------------------------
-function renderLogin(msg = '') {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<title>Admin Login</title>
-<style>
-body{background:#111;color:#eee;font-family:system-ui;padding:20px}
-input{width:200px;padding:6px;margin:8px 0}
-button{padding:6px 12px}
-.error{color:red}
-</style>
-</head>
-<body>
-<h2>管理员登录</h2>
-${msg ? `<p class="error">${escapeHTML(msg)}</p>` : ''}
-<form method="post">
-密码：<input type="password" name="password" required><br>
-<button type="submit">登录</button>
-</form>
-</body>
-</html>`;
-}
-
-// -------------------------
 // 工具函数
 // -------------------------
-function escapeHTML(str) {
-  return str.replace(/&/g,'&amp;')
-            .replace(/</g,'&lt;')
-            .replace(/>/g,'&gt;');
+function parseCookies(str) {
+  return Object.fromEntries(str.split(';').map(v => v.trim().split('=')));
 }
 
-function parseCookies(cookieHeader) {
-  const cookies = {};
-  cookieHeader.split(';').forEach(cookie => {
-    const [key, value] = cookie.split('=').map(c => c.trim());
-    if (key && value) cookies[key] = value;
-  });
-  return cookies;
+function escapeHTML(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function html(body) {
+  return new Response(body, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
