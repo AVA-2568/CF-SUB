@@ -4,7 +4,7 @@
  */
 
 const SUBUpdateTime = 6;
-const ALLOW_UA = /(clash|sing-box|singbox|v2ray|nekobox|surge|quantumult|loon)/i;
+const ALLOW_UA = /(clash|sing-box|singbox|v2ray|nekobox|surge|quantumult|loon|Shadowrocket)/i;
 
 const ADMIN_COOKIE_NAME = 'admin_auth';
 const ADMIN_COOKIE_MAX_AGE = 30 * 60;
