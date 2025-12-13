@@ -1,5 +1,6 @@
 ## CF-SUB
-通过 Cloudflare Workers 搭建专属于你的订阅链接，Powered by ChatGPT，目前测试下来应该没啥大毛病
+通过 Cloudflare Workers 搭建专属于你的订阅链接，目前测试下来应该没啥大毛病  
+Page没测试，按理来说区别不大
 
 ### 可能用到的变量：
 
@@ -13,3 +14,5 @@ SUB_TOKEN-----订阅密钥
 订阅和登录密钥分离，妈妈再也不用当心我后台被看光了  
 后台添加拉取记录（匿名-只记录地区和次数）-测试中  
 添加安全防护
+
+Powered by ChatGPT
