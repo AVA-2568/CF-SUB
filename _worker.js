@@ -29,8 +29,8 @@ async function handleSub(req, env) {
   const token = url.searchParams.get('token');
   const ua = (req.headers.get('User-Agent') || '').toLowerCase();
 
-  if (token !== env.SUB_TOKEN) return new Response('403', { status: 403 });
-  if (!ALLOW_UA.test(ua)) return new Response('403', { status: 403 });
+  if (token !== env.SUB_TOKEN) return new Response('404', { status: 404 });
+  if (!ALLOW_UA.test(ua)) return new Response('404', { status: 404 });
 
   const country = req.headers.get('CF-IPCountry') || 'N/A';
   const statKey = `stat:${country}`;
