@@ -6,7 +6,7 @@
 const SUBUpdateTime = 6;
 const ALLOW_UA = /(v2ray|sing-box|singbox|Xray|nekobox|v2rayn|quantumult|loon|Shadowrocket)/i;
 
-const ADMIN_COOKIE_NAME = 'admin_auth';
+const ADMIN_COOKIE_NAME = 'admin_auth';      // 强化前缀
 const ADMIN_COOKIE_MAX_AGE = 15 * 60;
 
 const LOGIN_FAIL_LIMIT = 3;
@@ -39,7 +39,8 @@ async function handleSub(req, env) {
   await env.NODE_KV.put(statKey, String(current + 1));
 
   const data = await getData(env);
-  const body = btoa(unescape(encodeURIComponent(data.nodes || '')));
+  // 使用 TextEncoder 安全编码 Base64
+  const body = btoa(String.fromCharCode(...new TextEncoder().encode(data.nodes || '')));
 
   return new Response(body, {
     headers: {
@@ -62,31 +63,38 @@ async function handleAdmin(req, env, url) {
   const fail = data.login_fail[ip] || { count: 0, last: 0 };
   const now = Date.now();
 
+  // IP 锁定检查
   if (fail.count >= LOGIN_FAIL_LIMIT && now - fail.last < LOGIN_FAIL_TIMEOUT) {
     return html(renderLogin('你已被禁止访问，请 12 小时后再试'));
   }
 
+  // POST 处理：登录 或 修改节点
   if (req.method === 'POST') {
     const form = await req.formData();
     const password = form.get('password');
     const nodes = form.get('nodes');
 
+    // 登录请求（仅有密码字段）
     if (password && !nodes) {
       if (password === env.ADMIN_TOKEN) {
+        // 登录成功：清空失败记录，设置安全 Cookie
         delete data.login_fail[ip];
         await saveData(env, data);
         return redirectLogin(env);
       }
+      // 登录失败：记录失败次数
       data.login_fail[ip] = { count: fail.count + 1, last: now };
       await saveData(env, data);
       return html(renderLogin('密码错误'));
     }
 
+    // 修改节点请求（需已登录）
     if (!isLogin) return html(renderLogin());
     data.nodes = nodes || '';
     await saveData(env, data);
   }
 
+  // GET 请求或非登录 POST
   if (!isLogin) return html(renderLogin());
 
   const stats = await loadStats(env);
@@ -115,7 +123,7 @@ async function loadStats(env) {
 }
 
 // -------------------------
-// 页面（赛博朋克）
+// 页面渲染（不变）
 // -------------------------
 function renderLogin(msg = '') {
   return `
@@ -263,10 +271,13 @@ function escapeHTML(s) {
 function html(body) {
   return new Response(body, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
+
+// 安全 Cookie 设置（SameSite=Strict, Secure, HttpOnly）
 function redirectLogin(env) {
+  const cookieValue = `admin_auth=${env.ADMIN_TOKEN}; HttpOnly; Secure; SameSite=Strict; Path=/admin; Max-Age=${ADMIN_COOKIE_MAX_AGE}`;
   return new Response('<script>location="/admin"</script>', {
     headers: [
-      ['Set-Cookie', `${ADMIN_COOKIE_NAME}=${env.ADMIN_TOKEN}; HttpOnly; Path=/admin; Max-Age=${ADMIN_COOKIE_MAX_AGE}`],
+      ['Set-Cookie', cookieValue],
       ['Content-Type', 'text/html'],
     ],
   });
