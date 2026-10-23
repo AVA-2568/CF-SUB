@@ -131,7 +131,7 @@ export function assertSecurityHeaders(response) {
   assert.match(response.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('x-frame-options'), 'DENY');
-  assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(response.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
   assert.match(response.headers.get('strict-transport-security') || '', /max-age=/);
   assert.match(response.headers.get('permissions-policy') || '', /camera=\(\)/);
 }

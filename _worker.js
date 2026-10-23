@@ -37,7 +37,8 @@ const LOGIN_RATE_TTL_SECONDS = 120;
 const MAX_NODES_BYTES = 128 * 1024;
 // URL 编码会把每个 UTF-8 字节最多扩展为 3 个 ASCII 字节，余量留给表单字段。
 const MAX_BODY_BYTES = MAX_NODES_BYTES * 3 + 64 * 1024;
-const MIN_SECRET_LENGTH = 32;
+const MIN_ADMIN_PASSWORD_LENGTH = 8;
+const MIN_SUB_TOKEN_LENGTH = 16;
 
 const textEncoder = new TextEncoder();
 const keyLocks = new Map();
@@ -95,11 +96,11 @@ function validateEnv(env) {
   if (!env || !env.NODE_KV || typeof env.NODE_KV.get !== 'function' || typeof env.NODE_KV.put !== 'function') {
     throw new HttpError(500, 'Server misconfigured: missing NODE_KV binding');
   }
-  if (typeof env.ADMIN_TOKEN !== 'string' || env.ADMIN_TOKEN.length < MIN_SECRET_LENGTH) {
-    throw new HttpError(500, `Server misconfigured: ADMIN_TOKEN must be at least ${MIN_SECRET_LENGTH} characters`);
+  if (typeof env.ADMIN_TOKEN !== 'string' || env.ADMIN_TOKEN.length < MIN_ADMIN_PASSWORD_LENGTH) {
+    throw new HttpError(500, `Server misconfigured: ADMIN_TOKEN must be at least ${MIN_ADMIN_PASSWORD_LENGTH} characters`);
   }
-  if (typeof env.SUB_TOKEN !== 'string' || env.SUB_TOKEN.length < MIN_SECRET_LENGTH) {
-    throw new HttpError(500, `Server misconfigured: SUB_TOKEN must be at least ${MIN_SECRET_LENGTH} characters`);
+  if (typeof env.SUB_TOKEN !== 'string' || env.SUB_TOKEN.length < MIN_SUB_TOKEN_LENGTH) {
+    throw new HttpError(500, `Server misconfigured: SUB_TOKEN must be at least ${MIN_SUB_TOKEN_LENGTH} characters`);
   }
   if (env.ADMIN_TOKEN === env.SUB_TOKEN) {
     throw new HttpError(500, 'Server misconfigured: ADMIN_TOKEN and SUB_TOKEN must be different');
@@ -554,8 +555,33 @@ function getClientIp(req) {
 }
 
 function assertSameOrigin(req, url) {
-  if (req.headers.get('Origin') !== url.origin) {
+  const secFetchSite = req.headers.get('Sec-Fetch-Site');
+  if (secFetchSite === 'cross-site') {
     throw new HttpError(403, 'Forbidden');
+  }
+
+  let requestOrigin = req.headers.get('Origin');
+  if (!requestOrigin) {
+    const referer = req.headers.get('Referer');
+    if (referer) {
+      try {
+        requestOrigin = new URL(referer).origin;
+      } catch {
+        throw new HttpError(403, 'Forbidden');
+      }
+    }
+  }
+
+  const allowedOrigins = new Set([url.origin.toLowerCase()]);
+  const host = req.headers.get('Host');
+  if (host) {
+    allowedOrigins.add(`${url.protocol}//${host}`.toLowerCase());
+  }
+
+  if (requestOrigin) {
+    if (!allowedOrigins.has(requestOrigin.toLowerCase())) {
+      throw new HttpError(403, 'Forbidden');
+    }
   }
 }
 
@@ -1053,7 +1079,7 @@ function baseHeaders() {
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
-    'Referrer-Policy': 'no-referrer',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
     'Strict-Transport-Security': 'max-age=31536000',
   };

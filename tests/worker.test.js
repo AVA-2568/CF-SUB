@@ -312,7 +312,7 @@ test('admin and subscription responses include security headers', async () => {
   assert.equal(sub.status, 200);
   assert.equal(sub.headers.get('cache-control'), 'no-store');
   assert.equal(sub.headers.get('x-content-type-options'), 'nosniff');
-  assert.equal(sub.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(sub.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
   assert.match(sub.headers.get('strict-transport-security') || '', /max-age=/);
 });
 
@@ -507,11 +507,81 @@ test('admin and subscription tokens must be different', async () => {
   assert.equal(response.status, 500);
 });
 
-test('secrets shorter than 32 characters are rejected', async () => {
+test('admin password shorter than 8 characters is rejected', async () => {
   const worker = await loadWorker();
-  const env = createEnv({ ADMIN_TOKEN: 'a'.repeat(31) });
-  const response = await worker.fetch(makeRequest('/admin'), env, new MockCtx());
-  assert.equal(response.status, 500);
+  const envShort = createEnv({ ADMIN_TOKEN: '1234567' });
+  const resShort = await worker.fetch(makeRequest('/admin'), envShort, new MockCtx());
+  assert.equal(resShort.status, 500);
+
+  const envValid = createEnv({ ADMIN_TOKEN: '12345678' });
+  const resValid = await worker.fetch(makeRequest('/admin'), envValid, new MockCtx());
+  assert.equal(resValid.status, 200);
+});
+
+test('subscription token shorter than 16 characters is rejected', async () => {
+  const worker = await loadWorker();
+  const envShort = createEnv({ SUB_TOKEN: '123456789012345' });
+  const resShort = await worker.fetch(makeRequest('/admin'), envShort, new MockCtx());
+  assert.equal(resShort.status, 500);
+
+  const envValid = createEnv({ SUB_TOKEN: '1234567890123456' });
+  const resValid = await worker.fetch(makeRequest('/admin'), envValid, new MockCtx());
+  assert.equal(resValid.status, 200);
+});
+
+test('login succeeds without Origin header when valid Referer is present (Safari behavior)', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const response = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: {
+      Referer: 'https://example.com/admin',
+    },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(response.status, 303);
+  const cookie = getCookie(response);
+  assert.ok(cookie);
+});
+
+test('login succeeds without Origin header when Sec-Fetch-Site is same-origin', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const response = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: {
+      'Sec-Fetch-Site': 'same-origin',
+    },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(response.status, 303);
+});
+
+test('login rejects cross-site requests via Sec-Fetch-Site', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const response = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: {
+      'Sec-Fetch-Site': 'cross-site',
+      Origin: 'https://example.com',
+    },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(response.status, 403);
+});
+
+test('login rejects cross-site Referer when Origin is absent', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const response = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: {
+      Referer: 'https://attacker.example.com/login',
+    },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(response.status, 403);
 });
 
 test('fresh deployment serves 500 for /sub but still lets admin initialize config', async () => {

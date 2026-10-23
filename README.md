@@ -20,8 +20,8 @@
 | 名称 | 类型 | 要求 |
 | --- | --- | --- |
 | `NODE_KV` | KV namespace binding | 名称必须完全一致 |
-| `ADMIN_TOKEN` | Secret / 环境变量 | 至少 32 个字符 |
-| `SUB_TOKEN` | Secret / 环境变量 | 至少 32 个字符，且不能与 `ADMIN_TOKEN` 相同 |
+| `ADMIN_TOKEN` | Secret / 环境变量 | 至少 8 个字符（管理后台登录密码） |
+| `SUB_TOKEN` | Secret / 环境变量 | 至少 16 个字符（订阅链接凭证），且不能与 `ADMIN_TOKEN` 相同 |
 
 `NODE_KV` 不是普通环境变量，必须在 Worker 的绑定设置中添加。只添加 `ADMIN_TOKEN`、`SUB_TOKEN` 而缺少 KV 绑定时，页面会返回 `Server misconfigured: missing NODE_KV binding`。
 
@@ -32,8 +32,8 @@
    - Variable name：`NODE_KV`
    - KV namespace：选择刚创建的 namespace
 3. 在 `Settings > Variables and Secrets` 添加：
-   - `ADMIN_TOKEN`：至少 32 字符的随机值
-   - `SUB_TOKEN`：至少 32 字符的另一个随机值
+   - `ADMIN_TOKEN`：至少 8 字符的管理员密码
+   - `SUB_TOKEN`：至少 16 字符的随机订阅凭证
 4. 将仓库中 `_worker.js` 的全部内容粘贴到 Worker 编辑器，部署。
 5. 访问 `https://你的域名/admin` 登录并保存节点配置。
 
@@ -119,7 +119,7 @@ npm run dev
 - 订阅拉取不写入任何 KV 统计 key；仅在首次读取已有配置时可能补写 `config:initialized` 初始化标记。后台统计只读取历史数据。
 - 订阅只校验 `SUB_TOKEN`，不把 User-Agent 当安全边界；Clash、mihomo、v2rayN、sing-box 等任意客户端都可拉取。
 - 管理页使用每次请求生成的 CSP nonce，禁止内联事件处理器和外部资源。
-- 所有管理 POST 校验同源 `Origin`，保存和登出还要求 Session 绑定的 CSRF token。
+- 所有管理 POST 校验同源来源（优先检查 `Sec-Fetch-Site`，支持 `Origin` 与同源 `Referer` 回退，兼容 Safari 等不同浏览器），保存和登出还要求 Session 绑定的 CSRF token。
 - Session 使用 `__Host-cf_sub_session` Cookie：`Path=/`、`Secure`、`HttpOnly`、`SameSite=Strict`，15 分钟过期。
 - Session 记录管理员 token 的 SHA-256 指纹；轮换 `ADMIN_TOKEN` 后既有 Session 自动失效。
 - `SUB_TOKEN` 是 URL 中的 Bearer Secret：不要公开分享；怀疑泄露时直接更换并重新部署。
@@ -143,8 +143,8 @@ Session、登录计数和限流状态保存在 Workers KV。KV 是最终一致�
 按提示检查：
 
 - `Server misconfigured: missing NODE_KV binding`：没有绑定 KV，或绑定名不是 `NODE_KV`。
-- `Server misconfigured: ADMIN_TOKEN must be at least 32 characters`：变量缺失、名称错误或长度不足。
-- `Server misconfigured: SUB_TOKEN must be at least 32 characters`：同上。
+- `Server misconfigured: ADMIN_TOKEN must be at least 8 characters`：变量缺失、名称错误或长度不足 8 字符。
+- `Server misconfigured: SUB_TOKEN must be at least 16 characters`：变量缺失、名称错误或长度不足 16 字符。
 - `Server misconfigured: ADMIN_TOKEN and SUB_TOKEN must be different`：两个 token 相同。
 
 修改绑定或变量后需要重新部署 Worker 才会生效。
