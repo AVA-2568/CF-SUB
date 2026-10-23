@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict';
+import { AuthDurableObject } from '../_worker.js';
 
 export class MockKV {
   constructor() {
     this.map = new Map();
     this.failKeys = new Set();
+    this.failPuts = new Set();
     this.puts = [];
   }
 
   async get(key, type) {
     if (Array.isArray(key)) {
+      if (key.length > 100) throw new Error('KV get(keys) supports at most 100 keys');
       for (const k of key) {
         if (this.failKeys.has(k)) throw new Error(`KV read failure: ${k}`);
       }
@@ -23,6 +26,7 @@ export class MockKV {
   }
 
   async put(key, value, options) {
+    if (this.failPuts.has(key)) throw new Error(`KV write failure: ${key}`);
     this.puts.push({ key, value, options });
     this.map.set(key, String(value));
   }
@@ -35,31 +39,88 @@ export class MockKV {
     const names = [...this.map.keys()].filter((name) => name.startsWith(prefix)).sort();
     const start = cursor ? Number(cursor) : 0;
     const page = names.slice(start, start + 1000);
+    const complete = start + 1000 >= names.length;
     return {
       keys: page.map((name) => ({ name })),
-      cursor: start + 1000 < names.length ? String(start + 1000) : undefined,
+      cursor: complete ? undefined : String(start + 1000),
+      list_complete: complete,
     };
   }
 }
 
-export class MockRateLimiter {
-  constructor(limit = 10, period = 60) {
-    this.limitCount = limit;
-    this.period = period;
-    this.entries = new Map();
-    this.calls = [];
+export class MockDOStorage {
+  constructor() {
+    this.map = new Map();
+    this.alarm = null;
+    this.failPuts = new Set();
   }
 
-  async limit({ key }) {
-    this.calls.push(key);
-    const now = Date.now();
-    let entry = this.entries.get(key);
-    if (!entry || now - entry.start >= this.period * 1000) {
-      entry = { start: now, count: 0 };
-      this.entries.set(key, entry);
+  async get(key) {
+    return this.map.get(key) ?? null;
+  }
+
+  async put(key, value) {
+    if (this.failPuts.has(key)) throw new Error(`DO write failure: ${key}`);
+    this.map.set(key, value);
+  }
+
+  async delete(key) {
+    this.map.delete(key);
+  }
+
+  async list({ prefix = '', limit } = {}) {
+    const entries = [...this.map.entries()]
+      .filter(([key]) => key.startsWith(prefix))
+      .sort(([a], [b]) => a.localeCompare(b));
+    return new Map(limit ? entries.slice(0, limit) : entries);
+  }
+
+  async getAlarm() {
+    return this.alarm;
+  }
+
+  async setAlarm(time) {
+    this.alarm = time;
+  }
+}
+
+export class MockAuthNamespace {
+  constructor() {
+    this.objects = new Map();
+    this.queues = new Map();
+    this.requests = [];
+  }
+
+  idFromName(name) {
+    return name;
+  }
+
+  get(id) {
+    let object = this.objects.get(id);
+    if (!object) {
+      object = new AuthDurableObject({ storage: new MockDOStorage() }, {});
+      this.objects.set(id, object);
     }
-    entry.count += 1;
-    return { success: entry.count <= this.limitCount };
+
+    const queue = this.queues.get(id) || Promise.resolve();
+    return {
+      fetch: (url, init) => {
+        this.requests.push({ id, url, init });
+        const request = new Request(url, init);
+        const run = () => object.fetch(request);
+        const result = queue.then(run, run);
+        this.queues.set(id, result.then(() => undefined, () => undefined));
+        return result;
+      },
+    };
+  }
+
+  async listAll(prefix) {
+    const entries = [];
+    for (const object of this.objects.values()) {
+      for (const [key, value] of await object.state.storage.list({ prefix })) entries.push([key, value]);
+    }
+    return entries;
   }
 }
 
@@ -82,9 +143,9 @@ export class MockCtx {
 export function createEnv(overrides = {}) {
   return {
     NODE_KV: new MockKV(),
-    LOGIN_RATE_LIMITER: new MockRateLimiter(10, 60),
-    ADMIN_TOKEN: 'admin-secret-123456',
-    SUB_TOKEN: 'sub-secret-123456',
+    AUTH: new MockAuthNamespace(),
+    ADMIN_TOKEN: 'admin-test-secret-0123456789abcdef',
+    SUB_TOKEN: 'sub-test-secret-0123456789abcdef',
     ...overrides,
   };
 }

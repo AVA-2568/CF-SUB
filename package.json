@@ -5,7 +5,20 @@
   "version": "1.0.0",
   "scripts": {
     "test": "node --test",
-    "check": "node --check _worker.js",
-    "ci": "npm run check && npm test"
+    "check": "node --check _worker.js && node --check scripts/check-deploy-config.mjs && node --check scripts/smoke-workers.mjs",
+    "ci": "npm run check && npm test",
+    "check:deploy-config": "node scripts/check-deploy-config.mjs",
+    "check:deploy-config:ci": "node scripts/check-deploy-config.mjs --allow-placeholder",
+    "dev": "wrangler dev",
+    "predeploy": "npm run check:deploy-config",
+    "deploy": "wrangler deploy",
+    "deploy:dry": "wrangler deploy --dry-run --outdir .wrangler-audit",
+    "smoke:workers": "node scripts/smoke-workers.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "wrangler": "^4.152.0"
   }
 }
