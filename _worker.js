@@ -650,7 +650,12 @@ function renderAdmin({ nodes, stats, token, origin, csrf, nonce }) {
     </div>
     <form method="post" action="/logout" class="logout-form">
       <input type="hidden" name="csrf" value="${escapeHTML(csrf)}">
-      <button class="logout-btn" type="submit" title="登出" aria-label="登出">⏻</button>
+      <button class="logout-btn" type="submit" title="退出登录" aria-label="退出登录">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+          <path d="M16 17v-3H9v-4h7V7l5 5-5 5M14 2a2 2 0 0 1 2 2v2h-2V4H5v16h9v-2h2v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9z"/>
+        </svg>
+        <span>退出登录</span>
+      </button>
     </form>
   </div>
 
@@ -761,9 +766,9 @@ body{
   color:#00f6ff;
   font-family:Consolas,"Courier New",monospace;
   display:flex;
-  align-items:center;
+  align-items:flex-start;
   justify-content:center;
-  padding:16px;
+  padding:24px 16px;
   position:relative;
   overflow-x:hidden;
 }
@@ -778,7 +783,7 @@ body::before{
   pointer-events:none;
   z-index:-1;
 }
-.login-wrapper{width:100%;max-width:400px;animation:fadeInUp 0.6s ease-out}
+.login-wrapper{width:100%;max-width:400px;margin:auto 0;animation:fadeInUp 0.6s ease-out}
 @keyframes fadeInUp{from{opacity:0;transform:translateY(30px);}to{opacity:1;transform:translateY(0);}}
 .container{width:100%;max-width:960px;animation:fadeIn 0.5s ease-out}
 @keyframes fadeIn{from{opacity:0;}to{opacity:1;}}
@@ -1023,23 +1028,31 @@ tr:hover{
 .btn-loader.is-loading{display:inline-block}
 .logout-form{display:flex;align-items:center;margin:0}
 .header-section .logout-btn{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
   width:auto;
   margin:0;
-  padding:8px 12px;
-  border:none;
+  padding:8px 14px;
+  border:1px solid rgba(255,77,106,0.3);
   border-radius:6px;
   color:#ff4d6a;
-  background:rgba(255,77,106,0.1);
-  font-size:1.4rem;
+  background:rgba(255,77,106,0.12);
+  font-size:14px;
+  font-family:inherit;
+  font-weight:600;
+  cursor:pointer;
   line-height:1;
-  letter-spacing:0;
+  letter-spacing:1px;
+  transition:all .2s;
 }
 .header-section .logout-btn::before{display:none}
 .header-section .logout-btn:hover{
   background:#ff4d6a;
   color:#fff;
-  transform:scale(1.1);
-  box-shadow:none;
+  border-color:#ff4d6a;
+  transform:translateY(-1px);
+  box-shadow:0 0 12px rgba(255,77,106,0.4);
 }
 @media (max-width:768px){
   body{padding:12px;align-items:flex-start;padding-top:20px}
@@ -1047,7 +1060,7 @@ tr:hover{
   textarea{height:200px;font-size:13px}
   button{padding:14px;font-size:14px}
   th,td{padding:10px 6px;font-size:13px}
-  .header-section .logout-btn{font-size:1.2rem}
+  .header-section .logout-btn{font-size:13px;padding:6px 10px}
   .stats-overview{gap:12px}
   .stat-card{padding:16px}
   .stat-value{font-size:1.5rem}
@@ -1059,7 +1072,7 @@ tr:hover{
   textarea{height:160px;font-size:12px}
   button{padding:12px;font-size:13px}
   th,td{padding:8px 4px;font-size:12px}
-  .header-section .logout-btn{font-size:1.1rem}
+  .header-section .logout-btn{font-size:12px;padding:6px 8px}
   .stats-overview{grid-template-columns:1fr}
   .stat-card{padding:14px}
   .stat-icon{font-size:1.5rem}
