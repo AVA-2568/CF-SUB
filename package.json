@@ -1,0 +1,11 @@
+{
+  "name": "cf-sub",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check _worker.js",
+    "ci": "npm run check && npm test"
+  }
+}
