@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { AuthDurableObject } from '../_worker.js';
 
 export class MockKV {
   constructor() {
@@ -48,82 +47,6 @@ export class MockKV {
   }
 }
 
-export class MockDOStorage {
-  constructor() {
-    this.map = new Map();
-    this.alarm = null;
-    this.failPuts = new Set();
-  }
-
-  async get(key) {
-    return this.map.get(key) ?? null;
-  }
-
-  async put(key, value) {
-    if (this.failPuts.has(key)) throw new Error(`DO write failure: ${key}`);
-    this.map.set(key, value);
-  }
-
-  async delete(key) {
-    this.map.delete(key);
-  }
-
-  async list({ prefix = '', limit } = {}) {
-    const entries = [...this.map.entries()]
-      .filter(([key]) => key.startsWith(prefix))
-      .sort(([a], [b]) => a.localeCompare(b));
-    return new Map(limit ? entries.slice(0, limit) : entries);
-  }
-
-  async getAlarm() {
-    return this.alarm;
-  }
-
-  async setAlarm(time) {
-    this.alarm = time;
-  }
-}
-
-export class MockAuthNamespace {
-  constructor() {
-    this.objects = new Map();
-    this.queues = new Map();
-    this.requests = [];
-  }
-
-  idFromName(name) {
-    return name;
-  }
-
-  get(id) {
-    let object = this.objects.get(id);
-    if (!object) {
-      object = new AuthDurableObject({ storage: new MockDOStorage() }, {});
-      this.objects.set(id, object);
-    }
-
-    const queue = this.queues.get(id) || Promise.resolve();
-    return {
-      fetch: (url, init) => {
-        this.requests.push({ id, url, init });
-        const request = new Request(url, init);
-        const run = () => object.fetch(request);
-        const result = queue.then(run, run);
-        this.queues.set(id, result.then(() => undefined, () => undefined));
-        return result;
-      },
-    };
-  }
-
-  async listAll(prefix) {
-    const entries = [];
-    for (const object of this.objects.values()) {
-      for (const [key, value] of await object.state.storage.list({ prefix })) entries.push([key, value]);
-    }
-    return entries;
-  }
-}
-
 export class MockCtx {
   constructor() {
     this.pending = [];
@@ -143,7 +66,6 @@ export class MockCtx {
 export function createEnv(overrides = {}) {
   return {
     NODE_KV: new MockKV(),
-    AUTH: new MockAuthNamespace(),
     ADMIN_TOKEN: 'admin-test-secret-0123456789abcdef',
     SUB_TOKEN: 'sub-test-secret-0123456789abcdef',
     ...overrides,

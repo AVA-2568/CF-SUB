@@ -60,11 +60,9 @@ assert.match(adminHtml, /NODE CONTROL/);
 const csrf = adminHtml.match(/name="csrf"\s+value="([^"]+)"/)?.[1];
 assert.ok(csrf, '管理页缺少 CSRF token');
 
-response = await request(`/sub?token=${encodeURIComponent(subToken)}`, {
-  headers: { 'User-Agent': 'v2rayN/6.0' },
-});
+response = await request(`/sub?token=${encodeURIComponent(subToken)}`);
 if (response.status === 500) {
-  throw new Error('订阅返回 500：请先在后台保存节点配置，或检查 KV/DO 初始化状态');
+  throw new Error('订阅返回 500：请先在后台保存节点配置，或检查 NODE_KV 绑定与配置初始化标记');
 }
 assert.equal(response.status, 200, `GET /sub 应为 200，实际 ${response.status}`);
 const encoded = await response.text();

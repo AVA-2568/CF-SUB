@@ -33,18 +33,8 @@ if (!/^[0-9a-f]{32}$/i.test(kvId || '')) {
   errors.push('NODE_KV 的 namespace id 必须是 32 位十六进制字符串');
 }
 
-const doBlock = config.match(/\[\[durable_objects\.bindings\]\][\s\S]*?(?=\n\[\[|\s*$)/)?.[0] || '';
-if (!/^name\s*=\s*"AUTH"$/m.test(doBlock)) {
-  errors.push('Durable Object binding 必须命名为 AUTH');
-}
-if (!/^class_name\s*=\s*"AuthDurableObject"$/m.test(doBlock)) {
-  errors.push('AUTH binding 必须指向 AuthDurableObject');
-}
-if (!/\[\[migrations\]\][\s\S]*?new_sqlite_classes\s*=\s*\[[^\]]*"AuthDurableObject"[^\]]*\]/.test(config)) {
-  errors.push('缺少 AuthDurableObject 的 new_sqlite_classes 迁移');
-}
-if (/\[\[ratelimits\]\]/.test(config)) {
-  errors.push('旧版 [[ratelimits]] 配置仍存在；登录限流已迁移到 Durable Object');
+if (/\[\[durable_objects\.bindings\]\]|\[\[migrations\]\]/.test(config)) {
+  errors.push('KV-only 版本不应再配置 Durable Objects');
 }
 
 if (errors.length > 0) {

@@ -7,25 +7,32 @@
  *   POST /admin           登录或保存节点
  *   POST /logout          撤销当前 Session
  *
- * 存储：
- *   Durable Object         Session、CSRF、登录限流、失败计数与配置初始化标记
- *   KV data                节点配置（只保存 { nodes }）
- *   KV stat:<country>      订阅次数尽力统计
+ * 存储（只依赖一个 KV binding：NODE_KV）：
+ *   KV data                 节点配置（只保存 { nodes }）
+ *   KV session:<uuid>       Session + CSRF（TTL 15 分钟）
+ *   KV login:<ipHash>       登录失败计数
+ *   KV rate:<ipHash>:<窗口>  登录频率限制
+ *   KV config:initialized   配置初始化标记
+ *   KV stat:<country>       历史订阅统计（当前版本只读）
  */
 
 const SUB_UPDATE_TIME = 6;
-const ALLOWED_UA = /(v2ray|sing-box|singbox|xray|nekobox|v2rayn|quantumult|loon|shadowrocket)/i;
 
 const SESSION_COOKIE_NAME = '__Host-cf_sub_session';
 const SESSION_TTL = 15 * 60;
 const SESSION_MAX_AGE = SESSION_TTL;
+const SUB_CACHE_TTL_MS = 60_000;
 
 const LOGIN_FAIL_LIMIT = 5;
 const LOGIN_FAIL_TIMEOUT = 15 * 60 * 1000;
 const LOGIN_FAIL_TTL_SECONDS = Math.ceil(LOGIN_FAIL_TIMEOUT / 1000);
 
 const CONFIG_KEY = 'data';
+const CONFIG_INITIALIZED_KEY = 'config:initialized';
 const STAT_BATCH_SIZE = 100;
+const LOGIN_RATE_LIMIT = 10;
+const LOGIN_RATE_WINDOW_MS = 60_000;
+const LOGIN_RATE_TTL_SECONDS = 120;
 // Workers Free 每次请求只有 10ms CPU；128 KiB 经实测 Base64 编码约 6ms，留出响应处理余量。
 const MAX_NODES_BYTES = 128 * 1024;
 // URL 编码会把每个 UTF-8 字节最多扩展为 3 个 ASCII 字节，余量留给表单字段。
@@ -33,6 +40,9 @@ const MAX_BODY_BYTES = MAX_NODES_BYTES * 3 + 64 * 1024;
 const MIN_SECRET_LENGTH = 32;
 
 const textEncoder = new TextEncoder();
+const keyLocks = new Map();
+let subscriptionCache = null;
+let subscriptionCacheVersion = 0;
 
 class HttpError extends Error {
   constructor(status, message, headers = {}) {
@@ -44,177 +54,6 @@ class HttpError extends Error {
 }
 
 
-export class AuthDurableObject {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    try {
-      if (request.method === 'POST' && path === '/session') return this.createSession(request);
-      if (request.method === 'POST' && path === '/login-rate') return this.checkRate(request);
-      if (path === '/config-state') {
-        if (request.method === 'GET') return this.getConfigState();
-        if (request.method === 'POST') return this.markConfigInitialized();
-      }
-
-      const sessionMatch = path.match(/^\/session\/([0-9a-f-]{36})$/i);
-      if (sessionMatch) {
-        if (request.method === 'GET') return this.getSession(sessionMatch[1], request.headers.get('x-session-credential'));
-        if (request.method === 'DELETE') return this.deleteSession(sessionMatch[1]);
-      }
-
-      const attemptMatch = path.match(/^\/login-attempt\/([0-9a-f]{64})$/i);
-      if (attemptMatch && request.method === 'POST') return this.reserveLoginAttempt(attemptMatch[1]);
-
-      const failureMatch = path.match(/^\/login-failure\/([0-9a-f]{64})$/i);
-      if (failureMatch && request.method === 'DELETE') return this.clearFailure(failureMatch[1]);
-
-      return jsonResponse({ error: 'not found' }, 404);
-    } catch (err) {
-      console.error('AuthDurableObject failed', { message: err.message });
-      return jsonResponse({ error: 'internal' }, 500);
-    }
-  }
-
-  async createSession(request) {
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return jsonResponse({ error: 'bad request' }, 400);
-    }
-
-    const credential = typeof body?.credential === 'string' && /^[0-9a-f]{64}$/i.test(body.credential)
-      ? body.credential.toLowerCase()
-      : null;
-    if (!credential) return jsonResponse({ error: 'bad request' }, 400);
-
-    const id = crypto.randomUUID();
-    const csrf = makeNonce();
-    await this.state.storage.put(`session:${id}`, { csrf, created: Date.now(), credential });
-    await this.ensureAlarm();
-    return jsonResponse({ id, csrf });
-  }
-
-  async getConfigState() {
-    return jsonResponse({ initialized: (await this.state.storage.get('config:initialized')) === true });
-  }
-
-  async markConfigInitialized() {
-    await this.state.storage.put('config:initialized', true);
-    return jsonResponse({ ok: true });
-  }
-
-  async getSession(id, credential) {
-    if (typeof credential !== 'string' || !/^[0-9a-f]{64}$/i.test(credential)) {
-      return jsonResponse({ error: 'bad request' }, 400);
-    }
-
-    const session = await this.state.storage.get(`session:${id}`);
-    if (!session) return jsonResponse({ error: 'not found' }, 404);
-    if (!(await safeEqual(session.credential, credential.toLowerCase()))) {
-      await this.state.storage.delete(`session:${id}`);
-      return jsonResponse({ error: 'not found' }, 404);
-    }
-    if (Date.now() - session.created > SESSION_TTL * 1000) {
-      await this.state.storage.delete(`session:${id}`);
-      return jsonResponse({ error: 'expired' }, 404);
-    }
-    return jsonResponse({ session: { csrf: session.csrf, created: session.created } });
-  }
-
-  async deleteSession(id) {
-    await this.state.storage.delete(`session:${id}`);
-    return jsonResponse({ ok: true });
-  }
-
-  async reserveLoginAttempt(key) {
-    const failure = await this.readFailure(key);
-    if (failure.count >= LOGIN_FAIL_LIMIT) {
-      return jsonResponse({
-        allowed: false,
-        count: failure.count,
-        retryAfter: Math.max(1, Math.ceil((failure.last + LOGIN_FAIL_TIMEOUT - Date.now()) / 1000)),
-      });
-    }
-
-    const next = { count: failure.count + 1, last: Date.now() };
-    await this.state.storage.put(`login:${key}`, next);
-    await this.ensureAlarm();
-    return jsonResponse({ allowed: true, count: next.count });
-  }
-
-  async clearFailure(key) {
-    await this.state.storage.delete(`login:${key}`);
-    return jsonResponse({ ok: true });
-  }
-
-  async checkRate(request) {
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return jsonResponse({ error: 'bad request' }, 400);
-    }
-
-    const keyHash = typeof body?.key === 'string' && /^[0-9a-f]{64}$/i.test(body.key)
-      ? body.key.toLowerCase()
-      : null;
-    if (!keyHash) return jsonResponse({ error: 'bad request' }, 400);
-
-    const key = `rate:${keyHash}`;
-    const now = Date.now();
-    let entry = await this.state.storage.get(key);
-    if (!entry || now - entry.start >= 60_000) entry = { start: now, count: 0 };
-    entry.count += 1;
-    await this.state.storage.put(key, entry);
-    await this.ensureAlarm();
-
-    return jsonResponse({
-      allowed: entry.count <= 10,
-      retryAfter: Math.max(1, Math.ceil((entry.start + 60_000 - now) / 1000)),
-    });
-  }
-
-  async readFailure(key) {
-    const failure = await this.state.storage.get(`login:${key}`);
-    if (!failure || Date.now() - failure.last > LOGIN_FAIL_TIMEOUT) return { count: 0, last: 0 };
-    return { count: failure.count, last: failure.last };
-  }
-
-  async ensureAlarm() {
-    if (typeof this.state.storage.getAlarm !== 'function' || typeof this.state.storage.setAlarm !== 'function') return;
-    const current = await this.state.storage.getAlarm();
-    if (current === null || current <= Date.now()) {
-      await this.state.storage.setAlarm(Date.now() + 60 * 60 * 1000);
-    }
-  }
-
-  async alarm() {
-    const now = Date.now();
-    let hasRemaining = false;
-
-    for (const [key, value] of await this.state.storage.list({ prefix: 'session:' })) {
-      if (now - value.created > SESSION_TTL * 1000) await this.state.storage.delete(key);
-      else hasRemaining = true;
-    }
-    for (const [key, value] of await this.state.storage.list({ prefix: 'login:' })) {
-      if (now - value.last > LOGIN_FAIL_TIMEOUT) await this.state.storage.delete(key);
-      else hasRemaining = true;
-    }
-    for (const [key, value] of await this.state.storage.list({ prefix: 'rate:' })) {
-      if (now - value.start >= 60_000) await this.state.storage.delete(key);
-      else hasRemaining = true;
-    }
-
-    if (hasRemaining) await this.state.storage.setAlarm(now + 60 * 60 * 1000);
-  }
-}
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
@@ -232,7 +71,7 @@ export default {
       switch (path) {
         case '/sub':
           if (req.method !== 'GET') return methodNotAllowed('GET');
-          return await handleSub(req, env, ctx);
+          return await handleSub(req, env, ctx, url);
         case '/admin':
           if (!['GET', 'POST'].includes(req.method)) return methodNotAllowed('GET, POST');
           return await handleAdmin(req, env, url);
@@ -254,28 +93,29 @@ export default {
 
 function validateEnv(env) {
   if (!env || !env.NODE_KV || typeof env.NODE_KV.get !== 'function' || typeof env.NODE_KV.put !== 'function') {
-    throw new HttpError(500, 'Server misconfigured');
+    throw new HttpError(500, 'Server misconfigured: missing NODE_KV binding');
   }
   if (typeof env.ADMIN_TOKEN !== 'string' || env.ADMIN_TOKEN.length < MIN_SECRET_LENGTH) {
-    throw new HttpError(500, 'Server misconfigured');
+    throw new HttpError(500, `Server misconfigured: ADMIN_TOKEN must be at least ${MIN_SECRET_LENGTH} characters`);
   }
   if (typeof env.SUB_TOKEN !== 'string' || env.SUB_TOKEN.length < MIN_SECRET_LENGTH) {
-    throw new HttpError(500, 'Server misconfigured');
+    throw new HttpError(500, `Server misconfigured: SUB_TOKEN must be at least ${MIN_SECRET_LENGTH} characters`);
   }
   if (env.ADMIN_TOKEN === env.SUB_TOKEN) {
-    throw new HttpError(500, 'Server misconfigured');
+    throw new HttpError(500, 'Server misconfigured: ADMIN_TOKEN and SUB_TOKEN must be different');
   }
 }
 
-function getAuthStub(env, name = 'auth-session') {
-  if (!env.AUTH || typeof env.AUTH.idFromName !== 'function' || typeof env.AUTH.get !== 'function') {
-    throw new HttpError(500, 'Server misconfigured');
-  }
-  return env.AUTH.get(env.AUTH.idFromName(name));
-}
-
-async function authFetch(env, path, init = {}, name = 'auth-session') {
-  return getAuthStub(env, name).fetch(`https://auth.internal${path}`, init);
+// 同一 isolate 内按 key 串行化 KV 读改写；跨地区仍受 KV 最终一致性限制。
+function withKeyLock(key, task) {
+  const previous = keyLocks.get(key) || Promise.resolve();
+  const run = previous.then(task, task);
+  const tail = run.then(() => undefined, () => undefined);
+  keyLocks.set(key, tail);
+  tail.finally(() => {
+    if (keyLocks.get(key) === tail) keyLocks.delete(key);
+  });
+  return run;
 }
 
 function isSecureConnection(url) {
@@ -290,31 +130,23 @@ function methodNotAllowed(allow) {
 // -------------------------
 // 订阅
 // -------------------------
-async function handleSub(req, env, ctx) {
-  const url = new URL(req.url);
+async function handleSub(req, env, ctx, url) {
   const token = url.searchParams.get('token') || '';
-  const ua = (req.headers.get('User-Agent') || '').toLowerCase();
-
   if (!(await safeEqual(token, env.SUB_TOKEN))) throw new HttpError(404, 'Not Found');
-  if (!ALLOWED_UA.test(ua)) throw new HttpError(404, 'Not Found');
 
-  const rawCountry = req.headers.get('CF-IPCountry') || 'XX';
-  const country = /^[A-Z0-9]{2}$/.test(rawCountry) ? rawCountry : 'XX';
-  const config = await getConfig(env);
-  const markerTask = ensureConfigInitialized(env).catch((err) => {
-    console.error('config marker migration failed', { message: err.message });
-  });
-  const statTask = incrementStat(env, country).catch((err) => {
-    console.error('stat update failed', { message: err.message });
-  });
-  if (ctx && typeof ctx.waitUntil === 'function') {
-    ctx.waitUntil(markerTask);
-    ctx.waitUntil(statTask);
-  } else {
-    await Promise.all([markerTask, statTask]);
+  let body = readCachedSubscription();
+  if (body === null) {
+    const cacheVersion = subscriptionCacheVersion;
+    const config = await getConfig(env);
+    const markerTask = ensureConfigInitialized(env).catch((err) => {
+      console.error('config marker migration failed', { message: err.message });
+    });
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(markerTask);
+    else await markerTask;
+
+    body = encodeBase64Utf8(config.nodes || '');
+    if (cacheVersion === subscriptionCacheVersion) cacheSubscription(body);
   }
-
-  const body = encodeBase64Utf8(config.nodes || '');
 
   return new Response(body, {
     status: 200,
@@ -324,6 +156,26 @@ async function handleSub(req, env, ctx) {
       'Profile-Update-Interval': String(SUB_UPDATE_TIME),
     },
   });
+}
+
+function readCachedSubscription() {
+  if (!subscriptionCache || subscriptionCache.expiresAt <= Date.now()) {
+    subscriptionCache = null;
+    return null;
+  }
+  return subscriptionCache.body;
+}
+
+function cacheSubscription(body) {
+  subscriptionCache = {
+    body,
+    expiresAt: Date.now() + SUB_CACHE_TTL_MS,
+  };
+}
+
+function invalidateSubscriptionCache() {
+  subscriptionCache = null;
+  subscriptionCacheVersion += 1;
 }
 
 function encodeBase64Utf8(value) {
@@ -363,27 +215,11 @@ async function handleAdmin(req, env, url) {
     }), { nonce });
   }
 
-  const ipHash = await sha256Hex(getClientIp(req));
-  const rateStore = authRateStore(ipHash);
-  const rateResponse = await authFetch(env, '/login-rate', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ key: ipHash }),
-  }, rateStore);
-  if (!rateResponse.ok) throw new HttpError(500, 'Auth store error');
-  const rate = await rateResponse.json();
-  if (!rate.allowed) {
-    return htmlResponse(renderLogin('操作过于频繁，请稍后再试', nonce), {
-      status: 429,
-      nonce,
-      extra: { 'Retry-After': String(rate.retryAfter || 60) },
-    });
-  }
-
   const form = await parseForm(req);
 
   if (form.has('password')) {
-    return handleLogin(form, env, ipHash, rateStore, nonce);
+    const ipHash = await sha256Hex(getClientIp(req));
+    return handleLogin(form, env, ipHash, nonce);
   }
 
   if (!session) return redirect('/admin');
@@ -395,11 +231,20 @@ async function handleAdmin(req, env, url) {
   return redirect('/admin?saved=1');
 }
 
-async function handleLogin(form, env, ipHash, rateStore, nonce) {
+async function handleLogin(form, env, ipHash, nonce) {
   const password = getStringField(form, 'password');
   if (password.length > 512) throw new HttpError(400, 'Bad Request');
 
-  const attempt = await reserveLoginAttempt(env, ipHash, rateStore);
+  const rate = await checkLoginRate(env, ipHash);
+  if (!rate.allowed) {
+    return htmlResponse(renderLogin('操作过于频繁，请稍后再试', nonce), {
+      status: 429,
+      nonce,
+      extra: { 'Retry-After': String(rate.retryAfter || 60) },
+    });
+  }
+
+  const attempt = await reserveLoginAttempt(env, ipHash);
   if (!attempt.allowed) {
     return htmlResponse(renderLogin('尝试次数过多，请稍后再试', nonce), {
       status: 429,
@@ -412,7 +257,7 @@ async function handleLogin(form, env, ipHash, rateStore, nonce) {
     return htmlResponse(renderLogin('密码错误', nonce), { status: 401, nonce });
   }
 
-  await clearLoginFailure(env, ipHash, rateStore);
+  await clearLoginFailure(env, ipHash);
   const session = await createSession(env);
   return redirectWithCookie('/admin', session.cookie);
 }
@@ -433,23 +278,19 @@ async function handleLogout(req, env, url) {
 }
 
 async function createSession(env) {
+  const id = crypto.randomUUID();
+  const csrf = makeNonce();
   const credential = await sha256Hex(env.ADMIN_TOKEN);
-  const response = await authFetch(env, '/session', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ credential }),
-  });
-  if (!response.ok) throw new HttpError(500, 'Auth store error');
-
-  const data = await response.json();
-  if (typeof data.id !== 'string' || typeof data.csrf !== 'string') {
-    throw new HttpError(500, 'Auth store error');
-  }
+  await env.NODE_KV.put(
+    `session:${id}`,
+    JSON.stringify({ csrf, created: Date.now(), credential }),
+    { expirationTtl: SESSION_TTL }
+  );
 
   return {
-    id: data.id,
-    csrf: data.csrf,
-    cookie: sessionCookie(data.id),
+    id,
+    csrf,
+    cookie: sessionCookie(id),
   };
 }
 
@@ -458,24 +299,38 @@ async function getSession(req, env) {
   const id = cookies[SESSION_COOKIE_NAME];
   if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id)) return null;
 
-  const credential = await sha256Hex(env.ADMIN_TOKEN);
-  const response = await authFetch(env, `/session/${id}`, {
-    headers: { 'x-session-credential': credential },
-  });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new HttpError(500, 'Auth store error');
+  const raw = await env.NODE_KV.get(`session:${id}`);
+  if (raw === null) return null;
 
-  const data = await response.json();
-  if (!data.session || typeof data.session.csrf !== 'string' || typeof data.session.created !== 'number') {
-    throw new HttpError(500, 'Auth store error');
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    await env.NODE_KV.delete(`session:${id}`);
+    return null;
   }
 
-  return { id, csrf: data.session.csrf, created: data.session.created };
+  if (!data || typeof data.csrf !== 'string' || typeof data.created !== 'number' || typeof data.credential !== 'string') {
+    await env.NODE_KV.delete(`session:${id}`);
+    return null;
+  }
+
+  const credential = await sha256Hex(env.ADMIN_TOKEN);
+  if (!(await safeEqual(data.credential, credential))) {
+    await env.NODE_KV.delete(`session:${id}`);
+    return null;
+  }
+
+  if (Date.now() - data.created > SESSION_TTL * 1000) {
+    await env.NODE_KV.delete(`session:${id}`);
+    return null;
+  }
+
+  return { id, csrf: data.csrf, created: data.created };
 }
 
 async function deleteSession(env, id) {
-  const response = await authFetch(env, `/session/${id}`, { method: 'DELETE' });
-  if (!response.ok) throw new HttpError(500, 'Auth store error');
+  await env.NODE_KV.delete(`session:${id}`);
 }
 
 function sessionCookie(id) {
@@ -493,19 +348,67 @@ async function requireCsrf(form, session) {
   }
 }
 
-async function reserveLoginAttempt(env, key, storeName) {
-  const response = await authFetch(env, `/login-attempt/${key}`, { method: 'POST' }, storeName);
-  if (!response.ok) throw new HttpError(500, 'Auth store error');
-  return response.json();
+async function reserveLoginAttempt(env, key) {
+  return withKeyLock(`login:${key}`, async () => {
+    const failure = await readLoginFailure(env, key);
+    if (failure.count >= LOGIN_FAIL_LIMIT) {
+      return {
+        allowed: false,
+        count: failure.count,
+        retryAfter: Math.max(1, Math.ceil((failure.last + LOGIN_FAIL_TIMEOUT - Date.now()) / 1000)),
+      };
+    }
+
+    const next = { count: failure.count + 1, last: Date.now() };
+    await env.NODE_KV.put(`login:${key}`, JSON.stringify(next), {
+      expirationTtl: LOGIN_FAIL_TTL_SECONDS,
+    });
+    return { allowed: true, count: next.count };
+  });
 }
 
-async function clearLoginFailure(env, key, storeName) {
-  const response = await authFetch(env, `/login-failure/${key}`, { method: 'DELETE' }, storeName);
-  if (!response.ok) throw new HttpError(500, 'Auth store error');
+async function readLoginFailure(env, key) {
+  const raw = await env.NODE_KV.get(`login:${key}`);
+  if (raw === null) return { count: 0, last: 0 };
+
+  try {
+    const value = JSON.parse(raw);
+    if (
+      !value ||
+      !Number.isInteger(value.count) ||
+      value.count < 0 ||
+      !Number.isFinite(value.last)
+    ) {
+      return { count: 0, last: 0 };
+    }
+    if (Date.now() - value.last > LOGIN_FAIL_TIMEOUT) return { count: 0, last: 0 };
+    return { count: value.count, last: value.last };
+  } catch {
+    return { count: 0, last: 0 };
+  }
 }
 
-function authRateStore(ipHash) {
-  return `auth-rate-${ipHash.slice(0, 2)}`;
+async function clearLoginFailure(env, key) {
+  await env.NODE_KV.delete(`login:${key}`);
+}
+
+async function checkLoginRate(env, key) {
+  const windowId = Math.floor(Date.now() / LOGIN_RATE_WINDOW_MS);
+  const storageKey = `rate:${key}:${windowId}`;
+
+  return withKeyLock(storageKey, async () => {
+    const current = Number.parseInt((await env.NODE_KV.get(storageKey)) || '0', 10);
+    const count = (Number.isFinite(current) ? current : 0) + 1;
+    await env.NODE_KV.put(storageKey, String(count), {
+      expirationTtl: LOGIN_RATE_TTL_SECONDS,
+    });
+
+    const windowEnd = (windowId + 1) * LOGIN_RATE_WINDOW_MS;
+    return {
+      allowed: count <= LOGIN_RATE_LIMIT,
+      retryAfter: Math.max(1, Math.ceil((windowEnd - Date.now()) / 1000)),
+    };
+  });
 }
 
 // -------------------------
@@ -537,13 +440,13 @@ async function getConfig(env, { allowUninitialized = false } = {}) {
 }
 
 async function saveConfig(env, nodes) {
-  // 先在强一致 Durable Object 落标记；即使后续 KV 数据写入失败，也不会被误判为全新部署。
-  await markConfigInitialized(env);
+  // 先写配置再写标记：首次保存时即使数据写入失败，也不会留下标记导致后台永久 500。
   await env.NODE_KV.put(CONFIG_KEY, JSON.stringify({ nodes }));
+  invalidateSubscriptionCache();
+  await markConfigInitialized(env);
 }
 
-// 旧部署可能已有 KV 数据但没有 DO 标记；首次读到数据时补写，避免后续数据丢失被误判为全新部署。
-// 同一个 isolate 内复用 Promise，避免订阅请求每次触发多一次 DO 往返。
+// 同一个 isolate 内复用 Promise，避免订阅请求每次多读一次标记。
 let configMarkerPromise = null;
 
 async function ensureConfigInitialized(env) {
@@ -559,16 +462,11 @@ async function ensureConfigInitialized(env) {
 }
 
 async function isConfigInitialized(env) {
-  const response = await authFetch(env, '/config-state');
-  if (!response.ok) throw new HttpError(500, 'Auth store error');
-  const data = await response.json();
-  if (typeof data.initialized !== 'boolean') throw new HttpError(500, 'Auth store error');
-  return data.initialized;
+  return (await env.NODE_KV.get(CONFIG_INITIALIZED_KEY)) === '1';
 }
 
 async function markConfigInitialized(env) {
-  const response = await authFetch(env, '/config-state', { method: 'POST' });
-  if (!response.ok) throw new HttpError(500, 'Auth store error');
+  await env.NODE_KV.put(CONFIG_INITIALIZED_KEY, '1');
 }
 
 async function loadStats(env) {
@@ -593,13 +491,6 @@ async function loadStats(env) {
   } while (true);
 
   return result;
-}
-
-async function incrementStat(env, country) {
-  const key = `stat:${country}`;
-  const current = Number.parseInt((await env.NODE_KV.get(key)) || '0', 10);
-  const next = Number.isFinite(current) ? current + 1 : 1;
-  await env.NODE_KV.put(key, String(next));
 }
 
 // -------------------------
@@ -703,7 +594,7 @@ function renderLogin(msg = '', nonce) {
 
 function renderAdmin({ nodes, stats, token, origin, csrf, nonce }) {
   const link = `${origin}/sub?token=${encodeURIComponent(token)}`;
-  const totalUsers = Object.values(stats).reduce((sum, value) => sum + value, 0);
+  const totalRequests = Object.values(stats).reduce((sum, value) => sum + value, 0);
   const regionCount = Object.keys(stats).length;
 
   const rows = Object.entries(stats)
@@ -740,8 +631,8 @@ function renderAdmin({ nodes, stats, token, origin, csrf, nonce }) {
   <div class="stats-overview">
     <div class="stat-card">
       <div class="stat-icon">📊</div>
-      <div class="stat-value">${totalUsers}</div>
-      <div class="stat-label">累计订阅请求</div>
+      <div class="stat-value">${totalRequests}</div>
+      <div class="stat-label">历史订阅请求</div>
     </div>
     <div class="stat-card">
       <div class="stat-icon">🌍</div>
@@ -750,8 +641,8 @@ function renderAdmin({ nodes, stats, token, origin, csrf, nonce }) {
     </div>
     <div class="stat-card">
       <div class="stat-icon">🕐</div>
-      <div class="stat-value">近似</div>
-      <div class="stat-label">KV 尽力统计</div>
+      <div class="stat-value">只读</div>
+      <div class="stat-label">统计已停写</div>
     </div>
   </div>
 
@@ -776,7 +667,7 @@ function renderAdmin({ nodes, stats, token, origin, csrf, nonce }) {
   </div>
 
   <div class="card">
-    <h2>订阅统计</h2>
+    <h2>历史订阅统计</h2>
     <table>
       <thead><tr><th>REGION</th><th>COUNT</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="2">NO DATA</td></tr>'}</tbody>
@@ -1204,12 +1095,6 @@ function textResponse(body, status = 200, extra = {}) {
   });
 }
 
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-  });
-}
 
 function redirect(location, status = 303, extra = {}) {
   return new Response(null, {

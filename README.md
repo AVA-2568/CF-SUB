@@ -1,33 +1,50 @@
 # CF-SUB
 
-通过 Cloudflare Workers 提供个人订阅链接与轻量管理后台。节点配置保存在 Workers KV；Session、CSRF 与登录限流由 Durable Object 原子管理。
+通过 Cloudflare Workers 提供个人订阅链接与轻量管理后台。单文件入口，运行时只依赖一个 Workers KV 绑定，不需要 Durable Objects。
 
-当前版本重点加固了配置数据保护、服务端 Session 撤销、登录暴破防护、CSRF、HTML 注入、订阅编码和部署配置校验。
+当前版本面向“后台粘贴 `_worker.js` + 绑定 KV + 设置变量”的部署方式；`wrangler.toml` 仅用于本地开发或命令行部署。
 
 ## 功能
 
-- `GET /sub?token=...`：按客户端 UA 返回 Base64 订阅。
+- `GET /sub?token=...`：返回 Base64 订阅，不依赖客户端 UA。
 - `GET /admin`：登录页或节点管理页。
 - `POST /admin`：登录或保存节点配置。
-- `POST /logout`：服务端撤销当前 Session 并清除 Cookie。
-- 后台查看订阅地区与近似请求统计。
-- 支持 128 KiB 以内节点配置；超限返回 `413`。该上限按 Workers Free 的 10ms CPU 限额实测确定。
+- `POST /logout`：删除服务端 Session 并清除 Cookie。
+- 后台查看历史订阅地区统计（只读）。
+- 节点配置上限 128 KiB，超限返回 `413`。
 
-## 架构与存储
+## 部署前准备
 
-- `NODE_KV`：`data` 保存 `{ "nodes": "..." }`，`stat:<country>` 保存近似统计。
-- `AUTH`：一个 Session Durable Object 保存 Session/CSRF 和 `config:initialized` 强一致初始化标记；登录失败与分钟级限流按 IP 哈希分片到 256 个 Durable Object。
-- 不引入运行时第三方依赖，入口保持为单文件 `_worker.js`。
+需要准备三项配置：
 
-## 前置要求
+| 名称 | 类型 | 要求 |
+| --- | --- | --- |
+| `NODE_KV` | KV namespace binding | 名称必须完全一致 |
+| `ADMIN_TOKEN` | Secret / 环境变量 | 至少 32 个字符 |
+| `SUB_TOKEN` | Secret / 环境变量 | 至少 32 个字符，且不能与 `ADMIN_TOKEN` 相同 |
 
-- Node.js 22+
-- Cloudflare 账号
-- Wrangler CLI（由项目依赖提供）
-- 一个 Workers KV namespace
-- Durable Objects（`wrangler.toml` 已配置 SQLite-backed class）
+`NODE_KV` 不是普通环境变量，必须在 Worker 的绑定设置中添加。只添加 `ADMIN_TOKEN`、`SUB_TOKEN` 而缺少 KV 绑定时，页面会返回 `Server misconfigured: missing NODE_KV binding`。
 
-## 配置
+## 在 Cloudflare 后台部署
+
+1. 在 Cloudflare 创建 Workers KV namespace。
+2. 进入 Worker 的 `Settings > Bindings`，添加 `KV Namespace`：
+   - Variable name：`NODE_KV`
+   - KV namespace：选择刚创建的 namespace
+3. 在 `Settings > Variables and Secrets` 添加：
+   - `ADMIN_TOKEN`：至少 32 字符的随机值
+   - `SUB_TOKEN`：至少 32 字符的另一个随机值
+4. 将仓库中 `_worker.js` 的全部内容粘贴到 Worker 编辑器，部署。
+5. 访问 `https://你的域名/admin` 登录并保存节点配置。
+
+注意：
+
+- 变量名区分大小写，不要给值额外加引号。
+- 不需要配置 `AUTH` binding，也不需要 Durable Objects。
+- 建议在 Worker 设置中将 compatibility date 设为 `2026-10-23` 或更新日期。
+- 使用 Secret 类型保存两个 token，不要写进代码或仓库。
+
+## 使用 Wrangler 部署
 
 安装依赖：
 
@@ -35,13 +52,13 @@
 npm ci
 ```
 
-### 1. 创建 KV
+创建 KV：
 
 ```bash
 npx wrangler kv namespace create NODE_KV
 ```
 
-把返回的 namespace id 写入 `wrangler.toml`：
+将返回的 namespace id 写入 `wrangler.toml`：
 
 ```toml
 [[kv_namespaces]]
@@ -49,34 +66,27 @@ binding = "NODE_KV"
 id = "你的 KV namespace id"
 ```
 
-### 2. Durable Object 配置
-
-`wrangler.toml` 已包含以下配置，不要删除：
-
-```toml
-[[durable_objects.bindings]]
-name = "AUTH"
-class_name = "AuthDurableObject"
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["AuthDurableObject"]
-```
-
-首次部署会创建 `AuthDurableObject`。后续不要修改已部署的 `v1` 迁移语义；需要新增 class 时使用新的迁移 tag。
-
-### 3. 配置 Secrets
-
-不要把密钥写进仓库或 `wrangler.toml`：
+写入两个 Secret：
 
 ```bash
 npx wrangler secret put ADMIN_TOKEN
 npx wrangler secret put SUB_TOKEN
 ```
 
-两个 token 至少 32 个字符，建议使用密码管理器生成 48 字符以上的随机值。`ADMIN_TOKEN` 用于后台登录，`SUB_TOKEN` 用于订阅链接，二者必须不同。`SUB_TOKEN` 的高熵值本身就是防止订阅 token 被枚举的主要边界。
+部署：
 
-### 4. 本地开发
+```bash
+npm run deploy
+```
+
+`predeploy` 会检查单文件入口、KV binding 和占位符。正式部署前可先运行：
+
+```bash
+npm run check:deploy-config
+npm run deploy:dry
+```
+
+## 本地开发
 
 按需创建 `.dev.vars`：
 
@@ -91,83 +101,63 @@ SUB_TOKEN="local-sub-token-change-me-0123456789abcdef"
 npm run dev
 ```
 
-访问 `http://localhost:8787/admin`。生产环境必须使用 HTTPS。
+访问 `http://localhost:8787/admin`。生产环境强制 HTTPS。
 
-### 5. 部署
+## KV 数据结构
 
-先替换 `wrangler.toml` 中的 KV namespace 占位符，再执行：
-
-```bash
-npm run deploy
-```
-
-`predeploy` 会检查 KV id、`NODE_KV`/`AUTH` binding、SQLite 迁移和残留占位符；检查失败会阻止部署。请使用 `npm run deploy`，不要直接调用 `npx wrangler deploy` 绕过检查。部署后访问：
-
-```text
-https://你的域名/admin
-```
-
-登录后页面会显示订阅链接。
-
-### 6. Workers 部署后验收
-
-用环境变量指向已部署的 Worker，执行只读 smoke（登录、后台访问、订阅读取、登出撤销，不会改写节点配置）：
-
-```bash
-WORKER_URL="https://你的域名" \
-ADMIN_TOKEN="你的 ADMIN_TOKEN" \
-SUB_TOKEN="你的 SUB_TOKEN" \
-npm run smoke:workers
-```
-
-PowerShell 写法：
-
-```powershell
-$env:WORKER_URL = "https://你的域名"
-$env:ADMIN_TOKEN = "你的 ADMIN_TOKEN"
-$env:SUB_TOKEN = "你的 SUB_TOKEN"
-npm run smoke:workers
-```
-
-如果刚部署还没保存节点，`/sub` 会返回 `500`，smoke 会明确提示先完成首次配置。
+- `data`：`{ "nodes": "..." }`，节点配置。
+- `session:<uuid>`：Session、CSRF 与管理员 token 指纹，TTL 15 分钟。
+- `login:<ipHash>`：登录失败计数，TTL 15 分钟。
+- `rate:<ipHash>:<窗口>`：每 IP 每分钟登录频率限制。
+- `config:initialized`：配置初始化标记，用于避免 KV 数据丢失后被误判为全新部署。
+- `stat:<country>`：历史订阅统计，当前版本只读，不再随订阅请求写入。
 
 ## 安全设计
 
-- 配置读取 fail-closed：KV 读取异常、JSON 损坏、结构不合法或超过 128 KiB 时返回 `500`/`413`，不会回退为空配置。
-- 保存时先在 Durable Object 写强一致 `config:initialized`，再写 KV `data`；第二步失败会留下可检测的 fail-closed 状态，不会把旧配置误判为全新部署。升级后首次读取既有 KV 配置也会懒迁移写入该标记：后台读取同步完成，订阅请求通过 `waitUntil()` 尽力完成，无需先保存一次。
+- 订阅 token 使用 SHA-256 摘要后的常量时间比较，避免直接字符串比较。
+- 订阅响应在单个 isolate 内缓存 60 秒的 Base64 结果，缓存命中时不读 KV、不解析 JSON、不重复编码；后台保存配置会立即清除本 isolate 缓存，其他 isolate 最多 60 秒后更新。
+- 订阅拉取不写入任何 KV 统计 key；仅在首次读取已有配置时可能补写 `config:initialized` 初始化标记。后台统计只读取历史数据。
+- 订阅只校验 `SUB_TOKEN`，不把 User-Agent 当安全边界；Clash、mihomo、v2rayN、sing-box 等任意客户端都可拉取。
+- 管理页使用每次请求生成的 CSP nonce，禁止内联事件处理器和外部资源。
+- 所有管理 POST 校验同源 `Origin`，保存和登出还要求 Session 绑定的 CSRF token。
 - Session 使用 `__Host-cf_sub_session` Cookie：`Path=/`、`Secure`、`HttpOnly`、`SameSite=Strict`，15 分钟过期。
-- Session、CSRF 与登录失败状态存放在 Durable Object，登出后旧 Cookie 立即失效，不依赖 KV 最终一致性。
-- Session 绑定 `ADMIN_TOKEN` 的 SHA-256 指纹；轮换管理员 token 会自动撤销全部既有 Session。
-- 所有管理 POST 校验 `Origin === url.origin`；保存和登出还要求 Session 绑定的 CSRF token。
-- 登录尝试由 Durable Object 原子预占，失败 5 次后锁定 15 分钟；另有每 IP 约 10 次/分钟的短时限流。限流按 IP 哈希前缀分片，避免所有来源挤占同一个实例。
-- 管理页使用每次请求生成的 CSP nonce，禁止内联事件处理器和外部资源；动态值按 HTML 上下文转义。
-- 订阅 token 采用常量时间比较；Base64 按 UTF-8 字节分块生成，避免大配置触发参数上限。
-- 请求体硬限制为 448 KiB（`3 * 128 KiB + 64 KiB`，容纳 UTF-8 内容的 URL 编码膨胀），解析前即拒绝超限流式请求。
-- 所有敏感响应带 `Cache-Control: no-store`、CSP、HSTS、`X-Frame-Options`、`X-Content-Type-Options`、`Referrer-Policy` 和 `Permissions-Policy`。
-- 非 localhost 的 HTTP 请求直接 308 到 HTTPS，不信任客户端可伪造的 `X-Forwarded-Proto`。
-- 登录失败记录按来源 IP 隔离，不写配置 key，也不会形成全账号统一锁死。
+- Session 记录管理员 token 的 SHA-256 指纹；轮换 `ADMIN_TOKEN` 后既有 Session 自动失效。
+- `SUB_TOKEN` 是 URL 中的 Bearer Secret：不要公开分享；怀疑泄露时直接更换并重新部署。
+- 订阅 URL 可能出现在 Cloudflare 访问日志、浏览器历史或第三方客户端日志中；不要把链接发给不可信对象。
+- `/sub` 不在代码内做 KV 计数或限流，避免每次拉取产生写入；需要抗滥用时使用 Cloudflare WAF Rate Limiting。
+- 登录失败 5 次后锁定 15 分钟；另有每 IP 约 10 次/分钟的短时限制。
+- 请求体流式读取并在解析前硬限制为 448 KiB，节点内容限制为 128 KiB。
+- 订阅与后台响应带 `Cache-Control: no-store`、CSP、HSTS、`X-Frame-Options`、`X-Content-Type-Options`、`Referrer-Policy` 和 `Permissions-Policy`。
+- 非 localhost 的 HTTP 请求返回 308 跳转到 HTTPS。
+- 配置读取 fail-closed：KV 读取异常、JSON 损坏、结构不合法或超限时返回 `500`/`413`，不会回退为空配置。
+- 保存时先写 `data` 再写初始化标记；如果标记写入失败，配置已经落盘，后续后台读取可继续补写标记。
 
-## 运维注意
+### KV 一致性限制
 
-- 升级后旧 Session 失效，需要重新登录。
-- 旧版本 Cookie 名称为 `admin_session`，新版本只读取 `__Host-cf_sub_session`。
-- `GET /logout` 返回 `405`，登出必须使用后台页面表单或 `POST /logout`。
-- 管理 POST 需要浏览器发送同源 `Origin` 头；使用 curl 调试时要手动添加。
-- 不要把订阅链接、后台 token 或 `.dev.vars` 提交到 Git。
-- 如果发现密钥泄露，立即用 `npx wrangler secret put` 轮换；轮换 `ADMIN_TOKEN` 会自动使全部既有 Session 失效。
-- 升级后首次访问后台或订阅时可能会补写初始化标记，这是预期行为。
-- KV 统计存在并发丢写和最终一致性，仅用于趋势参考；需要精确统计时应换 Analytics Engine。
-- 当前限流按 IP 生效，无法抵御大量分布式 IP 的定向暴破；高风险场景建议叠加 Cloudflare WAF / Access。
+Session、登录计数和限流状态保存在 Workers KV。KV 是最终一致性存储，跨地区读取可能短暂看到旧值；代码只在单个 isolate 内对同一 key 的读改写做串行化，无法提供 Durable Object 级别的全局强一致。后台历史统计属于只读展示，个人低并发场景足够使用；高风险场景建议叠加 Cloudflare Access / WAF。
 
-如果 Durable Object 中的 `config:initialized` 仍存在但 KV `data` 丢失，服务会故意返回 `500`，不要删除初始化标记来强制重建。请从备份恢复 `data`：
+## 常见问题
 
-```bash
-npx wrangler kv key put data --binding NODE_KV --path restored-data.json --remote
-```
+### 页面显示 `Server misconfigured`
 
-其中 `restored-data.json` 的内容必须是 `{"nodes":"..."}`，且换算后的 UTF-8 字节数不超过 128 KiB。
+按提示检查：
 
-## 测试与校验
+- `Server misconfigured: missing NODE_KV binding`：没有绑定 KV，或绑定名不是 `NODE_KV`。
+- `Server misconfigured: ADMIN_TOKEN must be at least 32 characters`：变量缺失、名称错误或长度不足。
+- `Server misconfigured: SUB_TOKEN must be at least 32 characters`：同上。
+- `Server misconfigured: ADMIN_TOKEN and SUB_TOKEN must be different`：两个 token 相同。
+
+修改绑定或变量后需要重新部署 Worker 才会生效。
+
+### `/sub` 返回 `500`
+
+通常是尚未在后台保存节点配置，或 KV 中 `data` 丢失/损坏。登录 `/admin` 保存一次即可；如果已有初始化标记但 `data` 丢失，服务会故意保持 fail-closed。
+
+### 登录后立即跳回登录页
+
+KV 写入跨地区传播存在延迟，等待几秒后重试。若持续出现，检查是否绑定到了正确的 KV namespace。
+
+## 测试
 
 ```bash
 npm ci
@@ -175,13 +165,7 @@ npm run ci
 npm run deploy:dry
 ```
 
-`npm run ci` 会执行语法检查和全部 Node 测试。CI 还会用 `check:deploy-config:ci` 校验配置结构、用 `deploy:dry` 验证 Worker 打包与 binding。正式部署前请再运行严格检查：
-
-```bash
-npm run check:deploy-config
-```
-
-测试覆盖配置 fail-closed、标记写失败、Session 撤销与 token 轮换、并发登录锁定、CSRF/Origin、XSS 编码、安全响应头、统计读取、128 KiB 边界、URL 编码请求体、分块 Base64 和流式请求体超限。
+测试覆盖登录与 Session、CSRF/Origin、登录限流、XSS 编码、安全响应头、订阅缓存与配置刷新、零统计写入、历史统计读取、128 KiB 边界、URL 编码请求体、分块 Base64 和流式请求体超限。
 
 ## 免责声明
 

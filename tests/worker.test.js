@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MockCtx,
-  MockDOStorage,
   MockKV,
   assertSecurityHeaders,
   createEnv,
@@ -15,7 +14,6 @@ import {
   makeRequest,
   seedConfig,
 } from './helpers.js';
-import { AuthDurableObject } from '../_worker.js';
 
 const MAX_NODES_BYTES = 128 * 1024;
 
@@ -98,7 +96,7 @@ test('rotating ADMIN_TOKEN invalidates existing sessions', async () => {
   assert.equal(admin.html.includes('NODE CONTROL'), false);
 });
 
-test('concurrent failed logins are atomically capped at five and never touch config', async () => {
+test('concurrent failed logins are capped at five in one isolate and never touch config', async () => {
   const worker = await loadWorker();
   const env = createEnv();
   await seedConfig(env, 'PRESERVED-NODES');
@@ -145,12 +143,13 @@ test('a correct password clears previous failures without weakening the lockout'
     assert.equal(response.status, 401);
   }
 
-  const failures = await env.AUTH.listAll('login:');
-  assert.equal(failures.length, 1);
-  assert.equal(failures[0][1].count, 5);
+  const failureKeys = await env.NODE_KV.list({ prefix: 'login:' });
+  assert.equal(failureKeys.keys.length, 1);
+  const failure = JSON.parse(await env.NODE_KV.get(failureKeys.keys[0].name));
+  assert.equal(failure.count, 5);
 });
 
-test('stats are loaded from KV multi-get and rendered in admin', async () => {
+test('historical stats are loaded from KV multi-get and rendered in admin', async () => {
   const worker = await loadWorker();
   const env = createEnv();
   const { cookie } = await login(worker, env);
@@ -172,6 +171,51 @@ test('maximum-size subscription payload encodes successfully', async () => {
   const encoded = await response.text();
   assert.ok(encoded.length > MAX_NODES_BYTES);
   assert.equal(atob(encoded).length, nodes.length);
+});
+
+test('subscription body is served from isolate cache without rereading KV', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  await seedConfig(env, 'CACHE-NODES');
+  const ctx = new MockCtx();
+  const first = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
+    headers: { 'User-Agent': 'v2rayN/6.0' },
+  }), env, ctx);
+  assert.equal(first.status, 200);
+  await ctx.flush();
+
+  env.NODE_KV.failKeys.add('data');
+  const second = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
+    headers: { 'User-Agent': 'v2rayN/6.0' },
+  }), env, new MockCtx());
+  assert.equal(second.status, 200);
+  assert.equal(Buffer.from(await second.text(), 'base64').toString('utf8'), 'CACHE-NODES');
+});
+
+test('saving config invalidates the cached subscription body', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  await seedConfig(env, 'OLD-NODES');
+  const { cookie } = await login(worker, env);
+  const { html } = await getAdminHtml(worker, env, cookie);
+  const csrf = extractCsrf(html);
+
+  const first = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
+    headers: { 'User-Agent': 'v2rayN/6.0' },
+  }), env, new MockCtx());
+  assert.equal(Buffer.from(await first.text(), 'base64').toString('utf8'), 'OLD-NODES');
+
+  const save = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Cookie: cookie, Origin: 'https://example.com' },
+    body: form({ nodes: 'NEW-NODES', csrf }),
+  }), env, new MockCtx());
+  assert.equal(save.status, 303);
+
+  const second = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
+    headers: { 'User-Agent': 'v2rayN/6.0' },
+  }), env, new MockCtx());
+  assert.equal(Buffer.from(await second.text(), 'base64').toString('utf8'), 'NEW-NODES');
 });
 
 test('subscription Base64 preserves UTF-8 content', async () => {
@@ -284,15 +328,12 @@ test('only documented methods are accepted', async () => {
   assert.equal(postSub.status, 405);
 });
 
-test('a missing auth store fails closed instead of disabling protection', async () => {
+test('a missing NODE_KV binding fails closed', async () => {
   const worker = await loadWorker();
-  const env = createEnv({ AUTH: undefined });
-  const response = await worker.fetch(makeRequest('/admin', {
-    method: 'POST',
-    headers: { Origin: 'https://example.com' },
-    body: form({ password: env.ADMIN_TOKEN }),
-  }), env, new MockCtx());
+  const env = createEnv({ NODE_KV: undefined });
+  const response = await worker.fetch(makeRequest('/admin'), env, new MockCtx());
   assert.equal(response.status, 500);
+  assert.match(await response.text(), /NODE_KV/);
 });
 
 test('a valid CSRF save persists only nodes', async () => {
@@ -310,19 +351,18 @@ test('a valid CSRF save persists only nodes', async () => {
   assert.equal(response.headers.get('location'), '/admin?saved=1');
   const stored = JSON.parse(await env.NODE_KV.get('data'));
   assert.deepEqual(stored, { nodes: 'NEW-NODES' });
-  assert.equal(await env.AUTH.objects.get('auth-session').state.storage.get('config:initialized'), true);
+  assert.equal(await env.NODE_KV.get('config:initialized'), '1');
 });
 
-test('a marker write failure prevents an existing config from being overwritten', async () => {
+test('a marker write failure keeps the saved config and can recover', async () => {
   const worker = await loadWorker();
   const env = createEnv();
   await seedConfig(env, 'ORIGINAL-NODES');
   const { cookie } = await login(worker, env);
   const { html } = await getAdminHtml(worker, env, cookie);
   const csrf = extractCsrf(html);
-  const coreStorage = env.AUTH.objects.get('auth-session').state.storage;
-  await coreStorage.delete('config:initialized');
-  coreStorage.failPuts.add('config:initialized');
+  await env.NODE_KV.delete('config:initialized');
+  env.NODE_KV.failPuts.add('config:initialized');
   const response = await worker.fetch(makeRequest('/admin', {
     method: 'POST',
     headers: { Cookie: cookie, Origin: 'https://example.com' },
@@ -330,11 +370,18 @@ test('a marker write failure prevents an existing config from being overwritten'
   }), env, new MockCtx());
   assert.equal(response.status, 500);
   const stored = JSON.parse(await env.NODE_KV.get('data'));
-  assert.equal(stored.nodes, 'ORIGINAL-NODES');
-  assert.equal(await coreStorage.get('config:initialized'), null);
+  assert.equal(stored.nodes, 'REPLACEMENT');
+  assert.equal(await env.NODE_KV.get('config:initialized'), null);
+
+  env.NODE_KV.failPuts.delete('config:initialized');
+  const recoveredWorker = await loadWorker();
+  const recovered = await getAdminHtml(recoveredWorker, env, cookie);
+  assert.equal(recovered.response.status, 200);
+  assert.match(recovered.html, /REPLACEMENT/);
+  assert.equal(await env.NODE_KV.get('config:initialized'), '1');
 });
 
-test('a data write failure leaves the initialization marker fail-closed', async () => {
+test('a data write failure leaves a fresh deployment retryable', async () => {
   const worker = await loadWorker();
   const env = createEnv();
   const { cookie } = await login(worker, env);
@@ -348,40 +395,77 @@ test('a data write failure leaves the initialization marker fail-closed', async 
   }), env, new MockCtx());
   assert.equal(save.status, 500);
   assert.equal(await env.NODE_KV.get('data'), null);
-  assert.equal(await env.AUTH.objects.get('auth-session').state.storage.get('config:initialized'), true);
+  assert.equal(await env.NODE_KV.get('config:initialized'), null);
+
   env.NODE_KV.failPuts.delete('data');
-  const admin = await getAdminHtml(worker, env, cookie);
-  assert.equal(admin.response.status, 500);
+  const retryPage = await getAdminHtml(worker, env, cookie);
+  assert.equal(retryPage.response.status, 200);
+  const retryCsrf = extractCsrf(retryPage.html);
+  const retry = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Cookie: cookie, Origin: 'https://example.com' },
+    body: form({ nodes: 'RETRY-NODES', csrf: retryCsrf }),
+  }), env, new MockCtx());
+  assert.equal(retry.status, 303);
+  assert.equal(JSON.parse(await env.NODE_KV.get('data')).nodes, 'RETRY-NODES');
+  assert.equal(await env.NODE_KV.get('config:initialized'), '1');
 });
 
-test('subscription rejects a bad token or disallowed user agent', async () => {
+test('a data write failure on an existing config preserves the old nodes', async () => {
   const worker = await loadWorker();
   const env = createEnv();
-  await seedConfig(env, 'NODES');
-  const badToken = await worker.fetch(makeRequest('/sub?token=wrong', {
-    headers: { 'User-Agent': 'v2rayN/6.0' },
-  }), env, new MockCtx());
-  assert.equal(badToken.status, 404);
-  const badUa = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
-    headers: { 'User-Agent': 'curl/8.0' },
-  }), env, new MockCtx());
-  assert.equal(badUa.status, 404);
-});
-
-test('subscription statistics are written through waitUntil', async () => {
-  const worker = await loadWorker();
-  const env = createEnv();
-  await seedConfig(env, 'NODES');
-  const ctx = new MockCtx();
-  const sub = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
-    headers: { 'User-Agent': 'v2rayN/6.0', 'CF-IPCountry': 'US' },
-  }), env, ctx);
-  assert.equal(sub.status, 200);
-  await ctx.flush();
-  assert.equal(await env.NODE_KV.get('stat:US'), '1');
+  await seedConfig(env, 'ORIGINAL-NODES');
   const { cookie } = await login(worker, env);
   const { html } = await getAdminHtml(worker, env, cookie);
-  assert.match(html, /<td>US<\/td>/);
+  const csrf = extractCsrf(html);
+  env.NODE_KV.failPuts.add('data');
+  const save = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Cookie: cookie, Origin: 'https://example.com' },
+    body: form({ nodes: 'REPLACEMENT', csrf }),
+  }), env, new MockCtx());
+  assert.equal(save.status, 500);
+  assert.equal(JSON.parse(await env.NODE_KV.get('data')).nodes, 'ORIGINAL-NODES');
+  assert.equal(await env.NODE_KV.get('config:initialized'), '1');
+});
+
+test('subscription accepts any client user agent and still requires the token', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  await seedConfig(env, 'NODES');
+  const missingToken = await worker.fetch(makeRequest('/sub', {
+    headers: { 'User-Agent': 'clash.meta/1.19.0' },
+  }), env, new MockCtx());
+  assert.equal(missingToken.status, 404);
+  const badToken = await worker.fetch(makeRequest('/sub?token=wrong', {
+    headers: { 'User-Agent': 'clash.meta/1.19.0' },
+  }), env, new MockCtx());
+  assert.equal(badToken.status, 404);
+  const valid = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
+    headers: { 'User-Agent': 'clash.meta/1.19.0' },
+  }), env, new MockCtx());
+  assert.equal(valid.status, 200);
+});
+
+test('subscription fetch does not write KV statistics', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  await seedConfig(env, 'NODES');
+  await env.NODE_KV.put('config:initialized', '1');
+  const writesBefore = env.NODE_KV.puts.length;
+  const ctx = new MockCtx();
+  const first = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
+    headers: { 'User-Agent': 'v2rayN/6.0', 'CF-IPCountry': 'US' },
+  }), env, ctx);
+  assert.equal(first.status, 200);
+  await ctx.flush();
+
+  const second = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
+    headers: { 'User-Agent': 'v2rayN/6.0', 'CF-IPCountry': 'US' },
+  }), env, new MockCtx());
+  assert.equal(second.status, 200);
+  assert.equal(env.NODE_KV.puts.length, writesBefore);
+  assert.equal(await env.NODE_KV.get('stat:US'), null);
 });
 
 test('admin POST rejects unsupported content types', async () => {
@@ -447,7 +531,7 @@ test('a missing data key with an initialization marker fails closed', async () =
   const worker = await loadWorker();
   const env = createEnv();
   await login(worker, env);
-  await env.AUTH.objects.get('auth-session').state.storage.put('config:initialized', true);
+  await env.NODE_KV.put('config:initialized', '1');
   const sub = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef', {
     headers: { 'User-Agent': 'v2rayN/6.0' },
   }), env, new MockCtx());
@@ -465,7 +549,7 @@ test('existing KV config is marked initialized on authenticated read', async () 
   const { response, html } = await getAdminHtml(worker, env, cookie);
   assert.equal(response.status, 200);
   assert.match(html, /LEGACY-NODES/);
-  assert.equal(await env.AUTH.objects.get('auth-session').state.storage.get('config:initialized'), true);
+  assert.equal(await env.NODE_KV.get('config:initialized'), '1');
 });
 
 test('subscription lazily migrates the marker for existing data', async () => {
@@ -478,7 +562,7 @@ test('subscription lazily migrates the marker for existing data', async () => {
   }), env, ctx);
   assert.equal(response.status, 200);
   await ctx.flush();
-  assert.equal(await env.AUTH.objects.get('auth-session').state.storage.get('config:initialized'), true);
+  assert.equal(await env.NODE_KV.get('config:initialized'), '1');
 });
 
 test('x-forwarded-proto cannot bypass the HTTPS redirect on a non-local host', async () => {
@@ -492,21 +576,17 @@ test('x-forwarded-proto cannot bypass the HTTPS redirect on a non-local host', a
   assert.equal(response.headers.get('location'), 'https://example.com/admin');
 });
 
-test('session credentials are sent in a header, not a Durable Object URL', async () => {
+test('sessions are stored in KV with a 15-minute TTL and token-bound credential', async () => {
   const worker = await loadWorker();
   const env = createEnv();
   const { cookie } = await login(worker, env);
-  await getAdminHtml(worker, env, cookie);
-  assert.equal(env.AUTH.requests.some(({ url }) => url.includes('credential=')), false);
-  assert.equal(env.AUTH.requests.some(({ init }) => init?.headers?.['x-session-credential']), true);
-});
-
-test('initialization marker alone does not keep the cleanup alarm scheduled', async () => {
-  const storage = new MockDOStorage();
-  await storage.put('config:initialized', true);
-  const object = new AuthDurableObject({ storage }, {});
-  await object.alarm();
-  assert.equal(await storage.getAlarm(), null);
+  const id = cookie.split('=')[1];
+  const raw = await env.NODE_KV.get(`session:${id}`);
+  assert.ok(raw);
+  const session = JSON.parse(raw);
+  assert.match(session.credential, /^[0-9a-f]{64}$/);
+  const put = env.NODE_KV.puts.find((entry) => entry.key === `session:${id}`);
+  assert.equal(put.options.expirationTtl, 900);
 });
 
 test('oversized stored config is rejected on read', async () => {
@@ -533,14 +613,14 @@ test('stats reads handle more than 100 KV keys in batches', async () => {
   assert.equal(html.includes('NO DATA'), false);
 });
 
-test('stats UI is labelled as approximate rather than real-time', async () => {
+test('stats UI is labelled as historical and read-only', async () => {
   const worker = await loadWorker();
   const env = createEnv();
   await seedConfig(env, 'NODES');
   const { cookie } = await login(worker, env);
   const { html } = await getAdminHtml(worker, env, cookie);
-  assert.match(html, /累计订阅请求/);
-  assert.match(html, /KV 尽力统计/);
+  assert.match(html, /历史订阅请求/);
+  assert.match(html, /统计已停写/);
   assert.equal(html.includes('实时'), false);
 });
 
