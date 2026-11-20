@@ -51,7 +51,7 @@ test('login cookie is host-scoped to / and logout revokes the server session', a
   const { response, cookie } = await login(worker, env);
   assert.equal(response.status, 303);
   const setCookie = response.headers.get('set-cookie') || '';
-  assert.match(setCookie, /^__Host-cf_sub_session=/);
+  assert.match(setCookie, /^__Host-sid=/);
   assert.match(setCookie, /Path=\//);
   assert.match(setCookie, /Secure/);
   assert.match(setCookie, /HttpOnly/);
@@ -312,7 +312,8 @@ test('admin and subscription responses include security headers', async () => {
   assert.equal(sub.status, 200);
   assert.equal(sub.headers.get('cache-control'), 'no-store');
   assert.equal(sub.headers.get('x-content-type-options'), 'nosniff');
-  assert.equal(sub.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
+  assert.equal(sub.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(sub.headers.get('x-robots-tag'), 'noindex, nofollow, noarchive');
   assert.match(sub.headers.get('strict-transport-security') || '', /max-age=/);
 });
 
@@ -698,7 +699,7 @@ test('percent-encoded cookie names cannot masquerade as __Host cookies', async (
   const worker = await loadWorker();
   const env = createEnv();
   const { cookie } = await login(worker, env);
-  const encoded = cookie.replace('__Host-cf_sub_session=', '%5F%5FHost-cf_sub_session=');
+  const encoded = cookie.replace('__Host-sid=', '%5F%5FHost-sid=');
   const response = await worker.fetch(makeRequest('/admin', {
     headers: { Cookie: encoded },
   }), env, new MockCtx());
@@ -729,4 +730,248 @@ test('chunked request bodies are hard-limited before form parsing', async () => 
   });
   const response = await worker.fetch(request, env, new MockCtx());
   assert.equal(response.status, 413);
+});
+
+test('POST without Origin, Referer, or Sec-Fetch-Site is rejected (fail-closed)', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const response = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(response.status, 403);
+});
+
+test('POST with Sec-Fetch-Site same-site is rejected', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const response = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { 'Sec-Fetch-Site': 'same-site', Origin: 'https://example.com' },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(response.status, 403);
+});
+
+test('login rate limit caps at 10 per minute and stops writing KV once exceeded', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const headers = { Origin: 'https://example.com', 'CF-Connecting-IP': '198.51.100.77' };
+  const statuses = [];
+  for (let i = 0; i < 14; i += 1) {
+    const res = await worker.fetch(makeRequest('/admin', {
+      method: 'POST',
+      headers,
+      body: form({ password: env.ADMIN_TOKEN }),
+    }), env, new MockCtx());
+    statuses.push(res.status);
+  }
+  assert.equal(statuses.slice(0, 10).every((s) => s === 303), true);
+  assert.equal(statuses.slice(10).every((s) => s === 429), true);
+  const ratePuts = env.NODE_KV.puts.filter((p) => p.key.startsWith('rate:'));
+  assert.equal(ratePuts.length, 10);
+});
+
+test('KV 429 write rate limit during login degrades to 429 instead of 500', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  env.NODE_KV.failPut429Prefixes.add('rate:');
+  const rateRes = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Origin: 'https://example.com', 'CF-Connecting-IP': '198.51.100.88' },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(rateRes.status, 429);
+
+  env.NODE_KV.failPut429Prefixes.delete('rate:');
+  env.NODE_KV.failPut429Prefixes.add('login:');
+  const failRes = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Origin: 'https://example.com', 'CF-Connecting-IP': '198.51.100.89' },
+    body: form({ password: 'wrong-password' }),
+  }), env, new MockCtx());
+  assert.equal(failRes.status, 429);
+});
+
+test('successful login skips unnecessary login-failure writes and revokes existing session', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const first = await login(worker, env);
+  assert.equal(first.response.status, 303);
+  assert.equal(env.NODE_KV.puts.filter((p) => p.key.startsWith('login:')).length, 0);
+  assert.equal(env.NODE_KV.deletes.filter((k) => k.startsWith('login:')).length, 0);
+
+  const firstSessionId = first.cookie.split('=')[1];
+  const second = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Cookie: first.cookie, Origin: 'https://example.com' },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(second.status, 303);
+  assert.equal(await env.NODE_KV.get(`session:${firstSessionId}`), null);
+});
+
+test('subscription response includes strict CSP and standard normalized Base64 without CRLF or BOM', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const { cookie } = await login(worker, env);
+  const { html } = await getAdminHtml(worker, env, cookie);
+  const csrf = extractCsrf(html);
+
+  const dirtyNodes = '\uFEFF  vless://uuid@example.com:443#NodeA  \r\n\r\n  ss://abc@example.com:8388#节点B \r\n  ';
+  const save = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Cookie: cookie, Origin: 'https://example.com' },
+    body: form({ nodes: dirtyNodes, csrf }),
+  }), env, new MockCtx());
+  assert.equal(save.status, 303);
+
+  const stored = JSON.parse(await env.NODE_KV.get('data'));
+  assert.equal(stored.nodes.includes('\r'), false);
+  assert.equal(stored.nodes.startsWith('\uFEFF'), false);
+
+  const sub = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef'), env, new MockCtx());
+  assert.equal(sub.status, 200);
+  assert.equal(sub.headers.get('content-security-policy'), "default-src 'none'; frame-ancestors 'none'");
+  const encoded = await sub.text();
+  assert.match(encoded, /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/);
+  const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+  assert.equal(decoded, 'vless://uuid@example.com:443#NodeA\nss://abc@example.com:8388#节点B');
+});
+
+test('logout rejects cross-origin requests and missing CSRF', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const { cookie } = await login(worker, env);
+  const { html } = await getAdminHtml(worker, env, cookie);
+  const csrf = extractCsrf(html);
+
+  const badOrigin = await worker.fetch(makeRequest('/logout', {
+    method: 'POST',
+    headers: { Cookie: cookie, Origin: 'https://evil.example.com' },
+    body: form({ csrf }),
+  }), env, new MockCtx());
+  assert.equal(badOrigin.status, 403);
+
+  const noCsrf = await worker.fetch(makeRequest('/logout', {
+    method: 'POST',
+    headers: { Cookie: cookie, Origin: 'https://example.com' },
+    body: form({}),
+  }), env, new MockCtx());
+  assert.equal(noCsrf.status, 403);
+});
+
+test('corrupted JSON or non-string nodes in KV fail closed with 500', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  await env.NODE_KV.put('data', '{invalid-json');
+  const res1 = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef'), env, new MockCtx());
+  assert.equal(res1.status, 500);
+
+  await env.NODE_KV.put('data', JSON.stringify({ nodes: 12345 }));
+  const res2 = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef'), env, new MockCtx());
+  assert.equal(res2.status, 500);
+});
+
+test('0.0.0.0 HTTP is redirected to HTTPS and incomplete KV binding fails closed', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const redirectRes = await worker.fetch(new Request('http://0.0.0.0:8787/admin', { redirect: 'manual' }), env, new MockCtx());
+  assert.equal(redirectRes.status, 308);
+  assert.equal(redirectRes.headers.get('location'), 'https://0.0.0.0:8787/admin');
+
+  const badKvEnv = createEnv({ NODE_KV: { get() {}, put() {} } });
+  const badKvRes = await worker.fetch(makeRequest('/admin'), badKvEnv, new MockCtx());
+  assert.equal(badKvRes.status, 500);
+});
+
+test('loadStats caps KV subrequests to stay within Workers Free limits', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  await seedConfig(env, 'NODES');
+  for (let i = 0; i < 2500; i += 1) {
+    await env.NODE_KV.put(`stat:C${String(i).padStart(4, '0')}`, '1');
+  }
+  const { cookie } = await login(worker, env);
+  const getsBefore = env.NODE_KV.gets.length;
+  const listsBefore = env.NODE_KV.listCalls;
+  const { response } = await getAdminHtml(worker, env, cookie);
+  assert.equal(response.status, 200);
+  const batchGets = env.NODE_KV.gets.slice(getsBefore).filter((g) => Array.isArray(g.key)).length;
+  const lists = env.NODE_KV.listCalls - listsBefore;
+  assert.ok(batchGets + lists <= 20, `stats subrequests should be capped at 20, got ${batchGets + lists}`);
+});
+
+test('default 404 and invalid /sub token return identical bodies to prevent route fingerprinting', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const unknownRes = await worker.fetch(makeRequest('/does-not-exist'), env, new MockCtx());
+  const badSubRes = await worker.fetch(makeRequest('/sub?token=wrong'), env, new MockCtx());
+  assert.equal(unknownRes.status, 404);
+  assert.equal(badSubRes.status, 404);
+  assert.equal(await unknownRes.text(), await badSubRes.text());
+});
+
+test('unauthenticated logout without cookie does not leak session cookie name', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const res = await worker.fetch(makeRequest('/logout', {
+    method: 'POST',
+    headers: { Origin: 'https://example.com' },
+    body: form({}),
+  }), env, new MockCtx());
+  assert.equal(res.status, 303);
+  assert.equal(res.headers.get('set-cookie'), null);
+});
+
+test('custom ADMIN_PATH and SUB_PATH hide default endpoints and update rendered links', async () => {
+  const worker = await loadWorker();
+  const env = createEnv({ ADMIN_PATH: '/p9x2k', SUB_PATH: '/s8q4w' });
+  await seedConfig(env, 'vless://hidden@example.com:443#Hidden');
+
+  const oldAdmin = await worker.fetch(makeRequest('/admin'), env, new MockCtx());
+  const oldSub = await worker.fetch(makeRequest('/sub?token=sub-test-secret-0123456789abcdef'), env, new MockCtx());
+  assert.equal(oldAdmin.status, 404);
+  assert.equal(oldSub.status, 404);
+
+  const loginRes = await worker.fetch(makeRequest('/p9x2k', {
+    method: 'POST',
+    headers: { Origin: 'https://example.com' },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(loginRes.status, 303);
+  assert.equal(loginRes.headers.get('location'), '/p9x2k');
+
+  const cookie = getCookie(loginRes);
+  const adminPage = await worker.fetch(makeRequest('/p9x2k', {
+    headers: { Cookie: cookie },
+  }), env, new MockCtx());
+  const html = await adminPage.text();
+  assert.match(html, /s8q4w\?token=/);
+  assert.match(html, /action="&#x2F;p9x2k&#x2F;logout"/);
+
+  const subRes = await worker.fetch(makeRequest('/s8q4w?token=sub-test-secret-0123456789abcdef'), env, new MockCtx());
+  assert.equal(subRes.status, 200);
+  assert.equal(Buffer.from(await subRes.text(), 'base64').toString('utf8'), 'vless://hidden@example.com:443#Hidden');
+});
+
+test('custom route paths reject double slashes and dot-dot traversal, and saveConfig degrades KV 429', async () => {
+  const worker = await loadWorker();
+  const badPath1 = await worker.fetch(makeRequest('/admin'), createEnv({ ADMIN_PATH: '//evil.com' }), new MockCtx());
+  const badPath2 = await worker.fetch(makeRequest('/admin'), createEnv({ SUB_PATH: '/../sub' }), new MockCtx());
+  assert.equal(badPath1.status, 500);
+  assert.equal(badPath2.status, 500);
+
+  const env = createEnv();
+  const { cookie } = await login(worker, env);
+  const { html } = await getAdminHtml(worker, env, cookie);
+  const csrf = extractCsrf(html);
+  env.NODE_KV.failPut429Prefixes.add('data');
+  const saveRes = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Cookie: cookie, Origin: 'https://example.com' },
+    body: form({ nodes: 'vless://test', csrf }),
+  }), env, new MockCtx());
+  assert.equal(saveRes.status, 429);
+  assert.equal(saveRes.headers.get('retry-after'), '1');
 });

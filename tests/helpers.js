@@ -5,10 +5,15 @@ export class MockKV {
     this.map = new Map();
     this.failKeys = new Set();
     this.failPuts = new Set();
+    this.failPut429Prefixes = new Set();
     this.puts = [];
+    this.deletes = [];
+    this.gets = [];
+    this.listCalls = 0;
   }
 
-  async get(key, type) {
+  async get(key, typeOrOptions) {
+    this.gets.push({ key, options: typeOrOptions });
     if (Array.isArray(key)) {
       if (key.length > 100) throw new Error('KV get(keys) supports at most 100 keys');
       for (const k of key) {
@@ -21,20 +26,28 @@ export class MockKV {
     if (this.failKeys.has(key)) throw new Error(`KV read failure: ${key}`);
     const value = this.map.get(key) ?? null;
     if (value === null) return null;
+    const type = typeof typeOrOptions === 'string' ? typeOrOptions : typeOrOptions?.type;
     return type === 'json' ? JSON.parse(value) : value;
   }
 
   async put(key, value, options) {
+    for (const prefix of this.failPut429Prefixes) {
+      if (key.startsWith(prefix)) {
+        throw new Error('KV PUT failed: 429 Too Many Requests');
+      }
+    }
     if (this.failPuts.has(key)) throw new Error(`KV write failure: ${key}`);
     this.puts.push({ key, value, options });
     this.map.set(key, String(value));
   }
 
   async delete(key) {
+    this.deletes.push(key);
     this.map.delete(key);
   }
 
   async list({ prefix = '', cursor } = {}) {
+    this.listCalls += 1;
     const names = [...this.map.keys()].filter((name) => name.startsWith(prefix)).sort();
     const start = cursor ? Number(cursor) : 0;
     const page = names.slice(start, start + 1000);
@@ -131,7 +144,8 @@ export function assertSecurityHeaders(response) {
   assert.match(response.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('x-frame-options'), 'DENY');
-  assert.equal(response.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
+  assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(response.headers.get('x-robots-tag'), 'noindex, nofollow, noarchive');
   assert.match(response.headers.get('strict-transport-security') || '', /max-age=/);
   assert.match(response.headers.get('permissions-policy') || '', /camera=\(\)/);
 }

@@ -1,6 +1,10 @@
 name = "cf-sub"
 main = "_worker.js"
 compatibility_date = "2026-10-23"
+upload_source_maps = true
+
+[observability]
+enabled = true
 
 [[kv_namespaces]]
 binding = "NODE_KV"

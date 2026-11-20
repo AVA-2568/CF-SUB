@@ -6,11 +6,11 @@
 
 ## 功能
 
-- `GET /sub?token=...`：返回 Base64 订阅，不依赖客户端 UA。
-- `GET /admin`：登录页或节点管理页。
-- `POST /admin`：登录或保存节点配置。
+- `GET /sub?token=...`：返回标准 RFC 4648 Base64（无折行、带 `=` 补齐）订阅，不依赖客户端 UA；输出前自动剥离 UTF-8 BOM、统一换行符为 `\n`、去除每行首尾空白与空行，避免代理客户端解析异常。
+- `GET /admin`：登录页或节点管理页，内置 128 KiB 实时字节计数与超限拦截。
+- `POST /admin`：登录或保存节点配置（保存时自动规范化 CRLF 与 BOM）。
 - `POST /logout`：删除服务端 Session 并清除 Cookie。
-- 后台查看历史订阅地区统计（只读）。
+- 后台查看历史订阅地区统计（只读，带 KV subrequest 上限保护）。
 - 节点配置上限 128 KiB，超限返回 `413`。
 
 ## 部署前准备
@@ -22,6 +22,8 @@
 | `NODE_KV` | KV namespace binding | 名称必须完全一致 |
 | `ADMIN_TOKEN` | Secret / 环境变量 | 至少 8 个字符（管理后台登录密码） |
 | `SUB_TOKEN` | Secret / 环境变量 | 至少 16 个字符（订阅链接凭证），且不能与 `ADMIN_TOKEN` 相同 |
+| `ADMIN_PATH` | 可选环境变量 | 自定义后台路径（默认 `/admin`，如 `/p9x2k`），隐藏默认入口防扫描 |
+| `SUB_PATH` | 可选环境变量 | 自定义订阅路径（默认 `/sub`，如 `/s8q4w`），隐藏默认入口防扫描 |
 
 `NODE_KV` 不是普通环境变量，必须在 Worker 的绑定设置中添加。只添加 `ADMIN_TOKEN`、`SUB_TOKEN` 而缺少 KV 绑定时，页面会返回 `Server misconfigured: missing NODE_KV binding`。
 
@@ -41,7 +43,7 @@
 
 - 变量名区分大小写，不要给值额外加引号。
 - 不需要配置 `AUTH` binding，也不需要 Durable Objects。
-- 建议在 Worker 设置中将 compatibility date 设为 `2026-10-23` 或更新日期。
+- 建议在 Worker 设置中将 compatibility date 设为 `2026-10-23` 或更新日期，并开启 Workers Logs（Observability）。
 - 使用 Secret 类型保存两个 token，不要写进代码或仓库。
 
 ## 使用 Wrangler 部署
@@ -79,7 +81,7 @@ npx wrangler secret put SUB_TOKEN
 npm run deploy
 ```
 
-`predeploy` 会检查单文件入口、KV binding 和占位符。正式部署前可先运行：
+`wrangler.toml` 默认开启 `upload_source_maps = true` 与 `[observability] enabled = true`（符合 Cloudflare Workers 官方最佳实践），`_worker.js` 错误日志统一输出为结构化 JSON 便于检索。`predeploy` 会检查单文件入口、KV binding 和占位符。正式部署前可先运行：
 
 ```bash
 npm run check:deploy-config
@@ -101,40 +103,39 @@ SUB_TOKEN="local-sub-token-change-me-0123456789abcdef"
 npm run dev
 ```
 
-访问 `http://localhost:8787/admin`。生产环境强制 HTTPS。
+访问 `http://localhost:8787/admin`（Safari 本地开发如需完整 `__Host-` + `Secure` Cookie 支持，请使用 `npx wrangler dev --local-protocol https`）。生产环境强制 HTTPS。
 
 ## KV 数据结构
 
 - `data`：`{ "nodes": "..." }`，节点配置。
 - `session:<uuid>`：Session、CSRF 与管理员 token 指纹，TTL 15 分钟。
-- `login:<ipHash>`：登录失败计数，TTL 15 分钟。
-- `rate:<ipHash>:<窗口>`：每 IP 每分钟登录频率限制。
+- `login:<ipHash>`：登录失败计数，TTL 15 分钟（仅登录失败时写入，`cacheTtl: 30`）。
+- `rate:<ipHash>:<窗口>`：每 IP 每分钟登录频率限制（超限后停止写入，`cacheTtl: 30`）。
 - `config:initialized`：配置初始化标记，用于避免 KV 数据丢失后被误判为全新部署。
-- `stat:<country>`：历史订阅统计，当前版本只读，不再随订阅请求写入。
+- `stat:<country>`：历史订阅统计，当前版本只读，不再随订阅请求写入，读取受 20 次 KV subrequest 上限保护。
 
-## 安全设计
+## 安全与平台规范设计
 
-- 订阅 token 使用 SHA-256 摘要后的常量时间比较，避免直接字符串比较。
-- 订阅响应在单个 isolate 内缓存 60 秒的 Base64 结果，缓存命中时不读 KV、不解析 JSON、不重复编码；后台保存配置会立即清除本 isolate 缓存，其他 isolate 最多 60 秒后更新。
+- 订阅 token、管理员密码与 CSRF 比较均采用 SHA-256 摘要定长化后优先调用 Workers 原生 `crypto.subtle.timingSafeEqual`（非 Workers 环境自动回退常量时间 XOR 循环）。
+- 订阅响应在单个 isolate 内缓存 60 秒的标准 Base64 结果，缓存命中时不读 KV、不解析 JSON、不重复编码；后台保存配置会立即清除本 isolate 缓存，其他 isolate 最多 60 秒后更新。
+- 严格遵守 Workers 跨请求 I/O 隔离规范：模块级仅保存纯内存数值/布尔状态，不跨请求共享含 I/O 的 Promise。
 - 订阅拉取不写入任何 KV 统计 key；仅在首次读取已有配置时可能补写 `config:initialized` 初始化标记。后台统计只读取历史数据。
-- 订阅只校验 `SUB_TOKEN`，不把 User-Agent 当安全边界；Clash、mihomo、v2rayN、sing-box 等任意客户端都可拉取。
-- 管理页使用每次请求生成的 CSP nonce，禁止内联事件处理器和外部资源。
-- 所有管理 POST 校验同源来源（优先检查 `Sec-Fetch-Site`，支持 `Origin` 与同源 `Referer` 回退，兼容 Safari 等不同浏览器），保存和登出还要求 Session 绑定的 CSRF token。
-- Session 使用 `__Host-cf_sub_session` Cookie：`Path=/`、`Secure`、`HttpOnly`、`SameSite=Strict`，15 分钟过期。
+- 订阅只校验 `SUB_TOKEN`，不把 User-Agent 当安全边界；Clash、mihomo、v2rayN、sing-box、Shadowrocket 等任意客户端都可拉取。
+- 管理页使用每次请求生成的 CSP nonce，禁止内联事件处理器和外部资源；订阅与纯文本响应同样携带严格兜底 CSP（`default-src 'none'; frame-ancestors 'none'`）。
+- 所有管理 POST（`/admin`、`/logout`）实行 fail-closed 同源校验：存在 `Sec-Fetch-Site` 时仅允许 `same-origin`（拦截 `cross-site`、`same-site` 等）；校验 `Origin` 或 `Referer` 与 `url.origin` 严格一致，三者全缺一律 `403`；保存与登出还要求 Session 绑定的 CSRF token。
+- Session 使用 `__Host-sid` Cookie：`Path=/`、`Secure`、`HttpOnly`、`SameSite=Strict`，15 分钟过期；重新登录时自动撤销旧 Session。
 - Session 记录管理员 token 的 SHA-256 指纹；轮换 `ADMIN_TOKEN` 后既有 Session 自动失效。
-- `SUB_TOKEN` 是 URL 中的 Bearer Secret：不要公开分享；怀疑泄露时直接更换并重新部署。
-- 订阅 URL 可能出现在 Cloudflare 访问日志、浏览器历史或第三方客户端日志中；不要把链接发给不可信对象。
-- `/sub` 不在代码内做 KV 计数或限流，避免每次拉取产生写入；需要抗滥用时使用 Cloudflare WAF Rate Limiting。
-- 登录失败 5 次后锁定 15 分钟；另有每 IP 约 10 次/分钟的短时限制。
+- 登录失败 5 次后锁定 15 分钟；另有每 IP 每分钟 10 次短时限制。超限后停止写入 KV 防止刷爆配额；遇到 Workers KV 单 key 1 次/秒写入限制（`429`）时优雅降级为 `429` 而非 `500`。
 - 请求体流式读取并在解析前硬限制为 448 KiB，节点内容限制为 128 KiB。
-- 订阅与后台响应带 `Cache-Control: no-store`、CSP、HSTS、`X-Frame-Options`、`X-Content-Type-Options`、`Referrer-Policy` 和 `Permissions-Policy`。
-- 非 localhost 的 HTTP 请求返回 308 跳转到 HTTPS。
+- 所有响应均带 `Cache-Control: no-store`、CSP、HSTS、`X-Frame-Options`、`X-Content-Type-Options`、`Referrer-Policy: no-referrer`、`X-Robots-Tag: noindex, nofollow, noarchive` 和 `Permissions-Policy`。
+- 默认 404 与无效 `/sub` 响应体完全一致，未携带 Cookie 的 `POST /logout` 不下发 `Set-Cookie`，Cookie 使用中性名称 `__Host-sid`，并支持通过 `ADMIN_PATH`/`SUB_PATH` 隐藏默认路由，最大限度消除公网扫描特征码。
+- 非本地回环地址（仅允许 `localhost`、`127.0.0.1`、`[::1]`）的 HTTP 请求返回 308 跳转到 HTTPS。
 - 配置读取 fail-closed：KV 读取异常、JSON 损坏、结构不合法或超限时返回 `500`/`413`，不会回退为空配置。
 - 保存时先写 `data` 再写初始化标记；如果标记写入失败，配置已经落盘，后续后台读取可继续补写标记。
 
-### KV 一致性限制
+### KV 一致性与限流说明
 
-Session、登录计数和限流状态保存在 Workers KV。KV 是最终一致性存储，跨地区读取可能短暂看到旧值；代码只在单个 isolate 内对同一 key 的读改写做串行化，无法提供 Durable Object 级别的全局强一致。后台历史统计属于只读展示，个人低并发场景足够使用；高风险场景建议叠加 Cloudflare Access / WAF。
+Session、登录计数和限流状态保存在 Workers KV。KV 是最终一致性存储且单 key 写入上限为 1 次/秒，跨地区读取可能短暂看到旧值（读缓存 `cacheTtl` 最小为 30 秒，且包含负缓存）。个人低并发场景足够使用；高并发或高风险场景建议叠加 Cloudflare WAF Rate Limiting、Workers 原生 Rate Limiting Binding 或 Cloudflare Access。
 
 ## 常见问题
 
@@ -165,7 +166,7 @@ npm run ci
 npm run deploy:dry
 ```
 
-测试覆盖登录与 Session、CSRF/Origin、登录限流、XSS 编码、安全响应头、订阅缓存与配置刷新、零统计写入、历史统计读取、128 KiB 边界、URL 编码请求体、分块 Base64 和流式请求体超限。
+测试覆盖登录与 Session、CSRF/fail-closed 同源校验、登录限流与 KV 429 降级、零写放大、XSS 编码、全响应安全头、订阅缓存与配置刷新、零统计写入、历史统计读取与 subrequest 上限、128 KiB 边界、URL 编码请求体、标准 Base64 编码与 CRLF/BOM 规范化以及流式请求体超限。如需在真实 workerd 运行时验证，可额外接入 `@cloudflare/vitest-plugin`。
 
 ## 免责声明
 

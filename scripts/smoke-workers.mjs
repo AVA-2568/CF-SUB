@@ -15,6 +15,7 @@ if (missing.length > 0) {
 }
 
 const origin = new URL(workerUrl).origin;
+// 注意：CF-Connecting-IP 仅在本地 wrangler dev 生效，Cloudflare 线上边缘节点会自动覆盖为真实客户端 IP。
 const clientIp = process.env.SMOKE_CLIENT_IP || `203.0.113.${(Date.now() % 200) + 1}`;
 
 function request(path, init = {}) {
@@ -47,7 +48,7 @@ if (response.status === 429) {
 assert.equal(response.status, 303, `登录应返回 303，实际 ${response.status}`);
 
 const setCookie = response.headers.get('set-cookie') || '';
-assert.match(setCookie, /^__Host-cf_sub_session=/);
+assert.match(setCookie, /^__Host-sid=/);
 assert.match(setCookie, /Secure/);
 assert.match(setCookie, /HttpOnly/);
 assert.match(setCookie, /SameSite=Strict/);
@@ -65,8 +66,14 @@ if (response.status === 500) {
   throw new Error('订阅返回 500：请先在后台保存节点配置，或检查 NODE_KV 绑定与配置初始化标记');
 }
 assert.equal(response.status, 200, `GET /sub 应为 200，实际 ${response.status}`);
+assert.equal(response.headers.get('cache-control'), 'no-store');
+assert.match(response.headers.get('content-security-policy') || '', /default-src 'none'/);
+assert.ok(response.headers.get('profile-update-interval'), '订阅响应缺少 Profile-Update-Interval');
+
 const encoded = await response.text();
+assert.match(encoded, /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/, '订阅响应不是合法的标准 Base64');
 const nodes = Buffer.from(encoded, 'base64').toString('utf8');
+assert.equal(nodes.includes('\r'), false, '订阅解码内容不应包含 CR 回车符');
 
 response = await request('/logout', {
   method: 'POST',
@@ -83,4 +90,4 @@ response = await request('/admin', { headers: { Cookie: cookie } });
 assert.equal(response.status, 200);
 assert.equal((await response.text()).includes('NODE CONTROL'), false, '登出后旧 Cookie 仍能访问后台');
 
-console.log(`Workers smoke 通过: ${origin}，订阅节点 ${nodes.length} 字符，旧 Cookie 已失效。`);
+console.log(`Workers smoke 通过: ${origin}，订阅节点 ${nodes.length} 字符，Base64 与安全头均合法，旧 Cookie 已失效。`);
