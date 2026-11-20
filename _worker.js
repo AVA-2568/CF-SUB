@@ -696,30 +696,40 @@ function assertSameOrigin(req, url) {
   const secFetchSite = req.headers.get('Sec-Fetch-Site');
   const normalizedSite = secFetchSite ? secFetchSite.trim().toLowerCase() : '';
   if (normalizedSite && normalizedSite !== 'same-origin') {
+    logError('origin_check_failed', { reason: 'sec_fetch_site', secFetchSite: normalizedSite });
     throw new HttpError(403, 'Forbidden');
   }
 
-  let requestOrigin = req.headers.get('Origin');
+  const rawOrigin = req.headers.get('Origin');
+  let requestOrigin = rawOrigin && rawOrigin.toLowerCase() !== 'null' ? rawOrigin : '';
   if (!requestOrigin) {
     const referer = req.headers.get('Referer');
     if (referer) {
       try {
         requestOrigin = new URL(referer).origin;
       } catch {
+        logError('origin_check_failed', { reason: 'invalid_referer' });
         throw new HttpError(403, 'Forbidden');
       }
     }
   }
 
-  const expectedOrigin = url.origin.toLowerCase();
+  const allowedOrigins = new Set([url.origin.toLowerCase()]);
+  const host = (req.headers.get('Host') || '').trim();
+  if (host && /^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::\d{1,5})?$/i.test(host)) {
+    allowedOrigins.add(`${url.protocol}//${host}`.toLowerCase());
+  }
+
   if (requestOrigin) {
-    if (requestOrigin.toLowerCase() !== expectedOrigin) {
+    if (!allowedOrigins.has(requestOrigin.toLowerCase())) {
+      logError('origin_check_failed', { reason: 'origin_mismatch', secFetchSite: normalizedSite || null });
       throw new HttpError(403, 'Forbidden');
     }
     return;
   }
 
   if (normalizedSite !== 'same-origin') {
+    logError('origin_check_failed', { reason: 'missing_origin_headers', rawOrigin: rawOrigin || null });
     throw new HttpError(403, 'Forbidden');
   }
 }
@@ -1246,6 +1256,7 @@ function htmlResponse(body, { status = 200, nonce, extra = {} } = {}) {
     headers: {
       ...baseHeaders(),
       'Content-Security-Policy': csp,
+      'Referrer-Policy': 'same-origin',
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Content-Type': 'text/html; charset=utf-8',
       ...extra,

@@ -975,3 +975,21 @@ test('custom route paths reject double slashes and dot-dot traversal, and saveCo
   assert.equal(saveRes.status, 429);
   assert.equal(saveRes.headers.get('retry-after'), '1');
 });
+
+test('login accepts Origin: null when Sec-Fetch-Site is same-origin and matches valid Host header', async () => {
+  const worker = await loadWorker();
+  const env = createEnv();
+  const res1 = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Origin: 'null', 'Sec-Fetch-Site': 'same-origin' },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(res1.status, 303);
+
+  const res2 = await worker.fetch(makeRequest('/admin', {
+    method: 'POST',
+    headers: { Host: 'custom.example.org', Origin: 'https://custom.example.org' },
+    body: form({ password: env.ADMIN_TOKEN }),
+  }), env, new MockCtx());
+  assert.equal(res2.status, 303);
+});
